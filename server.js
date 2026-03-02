@@ -221,8 +221,8 @@ app.post('/get-rate', async (req, res) => {
 
     // Logiwa sends an array but expects a single object back
     const result = out.length === 1 ? out[0] : out[0];
-    console.log('[GET-RATE] → Logiwa:', JSON.stringify({ data: result }, null, 2));
-return res.json({ data: result });
+    console.log('[GET-RATE] → Logiwa:', JSON.stringify([result], null, 2));
+return res.json([result]);
   } catch (err) {
     console.error('[GET-RATE] Fatal:', err.message);
     return res.json(parseLogiwaBody(req.body).map((o) => ({
