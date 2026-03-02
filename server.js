@@ -193,7 +193,7 @@ app.post('/get-rate', async (req, res) => {
         const prods = Array.isArray(dhlRes.data?.products) ? dhlRes.data.products : [];
         rateList = prods.map((p) => ({
           carrier:        order.carrier || 'DHLEC',
-          shippingOption: p.productId || p.productName || 'GND',
+          shippingOption: p.orderedProductId || p.productId || p.productName || 'GND',
           totalCost:      parseFloat(p.rateDetails?.totalAmount  || p.rateDetails?.baseAmount || 0),
           shippingCost:   parseFloat(p.rateDetails?.baseAmount   || 0),
           otherCost:      parseFloat(p.rateDetails?.otherAmount  || 0),
