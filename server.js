@@ -101,18 +101,22 @@ app.post('/get-rate', async (req, res) => {
       distributionCenter: DHL_DISTRIBUTION,
       packageDetail: {
         weight: {
-          unitOfMeasure: (pkg.weight?.Units || 'LB').toUpperCase(),
-          value: pkg.weight?.Value || 1,
+          unitOfMeasure: (pkg.weight?.Units || pkg.weight?.units || 'LB').toUpperCase(),
+          value: parseFloat(pkg.weight?.Value || pkg.weight?.value || 1),
         },
-        dimension: pkg.dimensions ? {
-          length: pkg.dimensions.Length || 0,
-          width: pkg.dimensions.Width || 0,
-          height: pkg.dimensions.Height || 0,
-          unitOfMeasure: (pkg.dimensions.Units || 'IN').toUpperCase(),
-        } : undefined,
+        ...(pkg.dimensions && {
+          dimension: {
+            length: pkg.dimensions.Length || pkg.dimensions.length || 0,
+            width: pkg.dimensions.Width || pkg.dimensions.width || 0,
+            height: pkg.dimensions.Height || pkg.dimensions.height || 0,
+            unitOfMeasure: (pkg.dimensions.Units || pkg.dimensions.units || 'IN').toUpperCase(),
+          },
+        }),
       },
       pickup: DHL_PICKUP_ID,
     };
+
+    console.log('[GET-RATE] Sending to DHL:', JSON.stringify(dhlRequest, null, 2));
 
     const dhlResponse = await axios.post(
       `${DHL_BASE_URL}/shipping/v4/products`,
@@ -125,40 +129,42 @@ app.post('/get-rate', async (req, res) => {
       }
     );
 
-    // Map DHL product list → Logiwa rateList format
-    const products = dhlResponse.data?.products || [];
+    console.log('[GET-RATE] DHL response:', JSON.stringify(dhlResponse.data, null, 2));
+
+    // Safely extract products — handle array or missing
+    const rawProducts = dhlResponse.data?.products;
+    const products = Array.isArray(rawProducts) ? rawProducts : [];
+
+    // Map DHL product list → Logiwa rateList format (must be an array)
     const rateList = products.map((product) => ({
       carrier: logiwaRequest.carrier || 'DHL eCommerce',
-      shippingOption: product.productName || product.productId,
-      totalCost: product.rateDetails?.totalAmount || 0,
-      shippingCost: product.rateDetails?.baseAmount || 0,
-      otherCost: product.rateDetails?.otherAmount || 0,
+      shippingOption: product.productId || product.productName || 'GND',
+      totalCost: parseFloat(product.rateDetails?.totalAmount || product.rateDetails?.baseAmount || 0),
+      shippingCost: parseFloat(product.rateDetails?.baseAmount || 0),
+      otherCost: parseFloat(product.rateDetails?.otherAmount || 0),
       currency: logiwaRequest.currency || 'USD',
     }));
 
+    // Logiwa requires the response at the TOP level (no data wrapper)
     const logiwaResponse = {
-      data: {
-        shipmentOrderCode: logiwaRequest.shipmentOrderCode,
-        shipmentOrderIdentifier: logiwaRequest.shipmentOrderIdentifier,
-        rateList,
-        isSuccessful: true,
-        message: '',
-      },
+      shipmentOrderCode: logiwaRequest.shipmentOrderCode,
+      shipmentOrderIdentifier: logiwaRequest.shipmentOrderIdentifier,
+      rateList,
+      isSuccessful: rateList.length > 0,
+      message: rateList.length === 0 ? 'No DHL products available for this shipment' : '',
     };
 
-    console.log('[GET-RATE] Success — returned', rateList.length, 'rates');
+    console.log('[GET-RATE] Returning to Logiwa:', JSON.stringify(logiwaResponse, null, 2));
     return res.json(logiwaResponse);
   } catch (err) {
     const errMsg = err.response?.data?.detail || err.response?.data?.message || err.message;
-    console.error('[GET-RATE] Error:', errMsg);
+    console.error('[GET-RATE] Error:', errMsg, JSON.stringify(err.response?.data, null, 2));
     return res.json({
-      data: {
-        shipmentOrderCode: req.body.shipmentOrderCode,
-        shipmentOrderIdentifier: req.body.shipmentOrderIdentifier,
-        rateList: [],
-        isSuccessful: false,
-        message: `Error getting rates: ${errMsg}`,
-      },
+      shipmentOrderCode: req.body.shipmentOrderCode,
+      shipmentOrderIdentifier: req.body.shipmentOrderIdentifier,
+      rateList: [],
+      isSuccessful: false,
+      message: `Error getting rates: ${errMsg}`,
     });
   }
 });
@@ -258,48 +264,44 @@ app.post('/create-label', async (req, res) => {
     const isBase64 = labelFormat !== 'zpl';
 
     const logiwaResponse = {
-      data: {
-        shipmentOrderIdentifier: logiwaRequest.shipmentOrderIdentifier,
-        shipmentOrderCode: logiwaRequest.shipmentOrderCode,
-        carrier: logiwaRequest.carrier || 'DHL eCommerce',
-        shippingOption: logiwaRequest.shippingOption,
-        packageResponse: [
-          {
-            packageSequenceNumber: pkg.packageSequenceNumber || 1,
-            trackingNumber,
-            encodedLabel: isBase64 ? labelData : Buffer.from(labelData).toString('base64'),
-            labelURL: dhlData.labelUrl || '',
-          },
-        ],
-        rateDetail: {
-          totalCost: dhlData.rateDetails?.totalAmount || 0,
-          shippingCost: dhlData.rateDetails?.baseAmount || 0,
-          otherCost: dhlData.rateDetails?.otherAmount || 0,
-          currency: logiwaRequest.currency || 'USD',
+      shipmentOrderIdentifier: logiwaRequest.shipmentOrderIdentifier,
+      shipmentOrderCode: logiwaRequest.shipmentOrderCode,
+      carrier: logiwaRequest.carrier || 'DHL eCommerce',
+      shippingOption: logiwaRequest.shippingOption,
+      packageResponse: [
+        {
+          packageSequenceNumber: pkg.packageSequenceNumber || 1,
+          trackingNumber,
+          encodedLabel: isBase64 ? labelData : Buffer.from(labelData).toString('base64'),
+          labelURL: dhlData.labelUrl || '',
         },
-        masterTrackingNumber: trackingNumber,
-        isSuccessful: true,
-        message: '',
+      ],
+      rateDetail: {
+        totalCost: dhlData.rateDetails?.totalAmount || 0,
+        shippingCost: dhlData.rateDetails?.baseAmount || 0,
+        otherCost: dhlData.rateDetails?.otherAmount || 0,
+        currency: logiwaRequest.currency || 'USD',
       },
+      masterTrackingNumber: trackingNumber,
+      isSuccessful: true,
+      message: '',
     };
 
     console.log('[CREATE-LABEL] Success — tracking:', trackingNumber);
     return res.json(logiwaResponse);
   } catch (err) {
     const errMsg = err.response?.data?.detail || err.response?.data?.message || err.message;
-    console.error('[CREATE-LABEL] Error:', errMsg, err.response?.data);
+    console.error('[CREATE-LABEL] Error:', errMsg, JSON.stringify(err.response?.data, null, 2));
     return res.json({
-      data: {
-        shipmentOrderIdentifier: req.body.shipmentOrderIdentifier,
-        shipmentOrderCode: req.body.shipmentOrderCode,
-        carrier: req.body.carrier || 'DHL eCommerce',
-        shippingOption: req.body.shippingOption,
-        packageResponse: [],
-        rateDetail: { totalCost: 0, shippingCost: 0, otherCost: 0, currency: 'USD' },
-        masterTrackingNumber: '',
-        isSuccessful: false,
-        message: `Error creating label: ${errMsg}`,
-      },
+      shipmentOrderIdentifier: req.body.shipmentOrderIdentifier,
+      shipmentOrderCode: req.body.shipmentOrderCode,
+      carrier: req.body.carrier || 'DHL eCommerce',
+      shippingOption: req.body.shippingOption,
+      packageResponse: [],
+      rateDetail: { totalCost: 0, shippingCost: 0, otherCost: 0, currency: 'USD' },
+      masterTrackingNumber: '',
+      isSuccessful: false,
+      message: `Error creating label: ${errMsg}`,
     });
   }
 });
