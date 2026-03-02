@@ -212,8 +212,10 @@ app.post('/get-rate', async (req, res) => {
       });
     }
 
-    console.log('[GET-RATE] → Logiwa:', JSON.stringify(out, null, 2));
-    return res.json(out);
+    // Logiwa sends an array but expects a single object back
+    const result = out.length === 1 ? out[0] : out[0];
+    console.log('[GET-RATE] → Logiwa:', JSON.stringify(result, null, 2));
+    return res.json(result);
   } catch (err) {
     console.error('[GET-RATE] Fatal:', err.message);
     return res.json(parseLogiwaBody(req.body).map((o) => ({
@@ -337,10 +339,11 @@ app.post('/create-label', async (req, res) => {
       }
     }
 
-    return res.json(out);
+    return res.json(out.length === 1 ? out[0] : out[0]);
   } catch (err) {
     console.error('[CREATE-LABEL] Fatal:', err.message);
-    return res.json(parseLogiwaBody(req.body).map((o) => ({
+    const o = parseLogiwaBody(req.body)[0] || {};
+    return res.json({
       shipmentOrderIdentifier: o.shipmentOrderIdentifier,
       shipmentOrderCode: o.shipmentOrderCode,
       carrier: o.carrier || 'DHLEC', shippingOption: o.shippingOption,
@@ -348,7 +351,7 @@ app.post('/create-label', async (req, res) => {
       rateDetail: { totalCost:0, shippingCost:0, otherCost:0, currency:'USD' },
       masterTrackingNumber: '', isSuccessful: false,
       message: `Middleware error: ${err.message}`,
-    })));
+    });
   }
 });
 
@@ -370,9 +373,10 @@ app.post('/void-label', async (req, res) => {
         out.push({ shipmentOrderIdentifier:order.shipmentOrderIdentifier, masterTrackingNumber:trk, isSuccessful:alreadyVoided, message: alreadyVoided ? 'Already voided' : `DHL error: ${e.message}` });
       }
     }
-    return res.json(out);
+    return res.json(out.length === 1 ? out[0] : out[0]);
   } catch (err) {
-    return res.json(parseLogiwaBody(req.body).map((o) => ({ shipmentOrderIdentifier:o.shipmentOrderIdentifier, masterTrackingNumber:o.masterTrackingNumber||'', isSuccessful:false, message:`Error: ${err.message}` })));
+    const o = parseLogiwaBody(req.body)[0] || {};
+    return res.json({ shipmentOrderIdentifier:o.shipmentOrderIdentifier, masterTrackingNumber:o.masterTrackingNumber||'', isSuccessful:false, message:`Error: ${err.message}` });
   }
 });
 
