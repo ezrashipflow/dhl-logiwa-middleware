@@ -151,6 +151,7 @@ app.post('/get-rate', async (req, res) => {
     for (const order of orders) {
       const pkg      = order.requestedPackageLineItems?.[0] || {};
       const shipTo   = getAddr(order.shipTo);
+      const toContact = getContact(order.shipTo);
       const weightLB = weightToLB(pkg.weight?.Value || pkg.weight?.value, pkg.weight?.Units || pkg.weight?.units);
       const dims     = pkg.dimensions || {};
       const l = parseFloat(dims.Length || dims.length || 0);
@@ -159,6 +160,7 @@ app.post('/get-rate', async (req, res) => {
 
       const dhlReq = {
         consigneeAddress: {
+          name:       toContact.name || toContact.company || 'Recipient',
           address1:   shipTo.address1   || 'N/A',
           address2:   shipTo.address2,
           city:       shipTo.city       || 'N/A',
@@ -170,7 +172,7 @@ app.post('/get-rate', async (req, res) => {
         distributionCenter: DHL_DISTRIBUTION,
         pickup: DHL_PICKUP_ID,
         packageDetail: {
-          packageId:          `RATE-${(order.shipmentOrderCode || '').replace(/[^A-Za-z0-9]/g,'')}-${Date.now()}`.slice(0, 40),
+          packageId:          `RATE-${(order.shipmentOrderCode || '').replace(/[^A-Za-z0-9]/g,'')}-${Date.now()}`.slice(0, 30),
           packageDescription: order.shipmentOrderCode || 'Shipment',
           weight: { unitOfMeasure: 'LB', value: weightLB },
           ...(l > 0 && w > 0 && h > 0 && {
