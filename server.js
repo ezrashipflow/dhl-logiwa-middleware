@@ -163,7 +163,7 @@ app.post('/get-rate', async (req, res) => {
           address2:   shipTo.address2,
           city:       shipTo.city       || 'N/A',
           state:      shipTo.state,
-          postalCode: shipTo.postalCode || '00000',
+          postalCode: shipTo.postalCode,
           country:    shipTo.country    || 'US',
         },
         returnAddress: buildReturnAddress(order.shipFrom),
