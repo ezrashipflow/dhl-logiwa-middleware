@@ -287,15 +287,14 @@ app.post('/create-label', async (req, res) => {
       // International customs
       const customs = order.internationalOptions?.customsItems;
       if (Array.isArray(customs) && customs.length > 0) {
-        dhlReq.customsDetails = {
-          customsItems: customs.map((item) => ({
-            description:     item.description || 'Merchandise',
-            quantity:        parseInt(item.quantity) || 1,
-            declaredValue:   parseFloat(item.declaredValue) || 0,
-            weight:          parseFloat(item.weight) || weightLB,
-            countryOfOrigin: item.originCountryCode || 'US',
-            hsTariffCode:    item.hsTariffCode || '',
-          })),
+    dhlReq.customsDetails = customs.map((item) => ({
+  description:     item.description || 'Merchandise',
+  quantity:        parseInt(item.quantity) || 1,
+  declaredValue:   parseFloat(item.declaredValue) || 0,
+  weight:          parseFloat(item.weight) || weightLB,
+  countryOfOrigin: item.originCountryCode || 'US',
+  hsTariffCode:    item.hsTariffCode || '',
+}));
         };
       }
 
