@@ -108,7 +108,7 @@ function mapServiceToDHL(s) {
 
 // Default return/ship-from address (fallback if Logiwa doesn't send it)
 const DEFAULT_FROM = {
-  name: 'ShipFlow', company: 'ShipFlow',
+  name: 'ShipFlow',
   address1: '625 JERSEY AVE STE 9', address2: '',
   city: 'NEW BRUNSWICK', state: 'NJ', postalCode: '08901', country: 'US',
   phone: '9085253857', email: 'info@shipflow.co',
@@ -119,7 +119,6 @@ function buildReturnAddress(shipFrom) {
   const c = getContact(shipFrom);
   return {
     name:       c.name    || DEFAULT_FROM.name,
-    company:    c.company || DEFAULT_FROM.company,
     address1:   a.address1   || DEFAULT_FROM.address1,
     address2:   a.address2   || DEFAULT_FROM.address2,
     city:       a.city       || DEFAULT_FROM.city,
