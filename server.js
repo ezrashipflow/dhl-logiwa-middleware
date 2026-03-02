@@ -78,10 +78,13 @@ function getContact(obj) {
 function weightToLB(value, unit) {
   const v = parseFloat(value) || 0;
   const u = (unit || 'LB').toUpperCase();
-  if (u === 'OZ') return Math.max(parseFloat((v / 16).toFixed(4)), 0.0625);
-  if (u === 'G')  return parseFloat((v / 453.592).toFixed(4));
-  if (u === 'KG') return parseFloat((v * 2.20462).toFixed(4));
-  return Math.max(v, 0.0625);
+  let lb;
+  if (u === 'OZ') lb = v / 16;
+  else if (u === 'G')  lb = v / 453.592;
+  else if (u === 'KG') lb = v * 2.20462;
+  else lb = v;
+  // DHL requires weight as a multiple of 0.01 — round UP to 2 decimal places
+  return Math.max(Math.ceil(lb * 100) / 100, 0.01);
 }
 
 function mapServiceToDHL(s) {
