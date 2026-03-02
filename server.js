@@ -281,8 +281,6 @@ app.post('/create-label', async (req, res) => {
           phone:       toContact.phone   || '',
           email:       toContact.email   || '',
         },
-        labelFormat: labelFmt,
-      };
 
       // International customs
       const customs = order.internationalOptions?.customsItems;
