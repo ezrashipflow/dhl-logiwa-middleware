@@ -194,14 +194,14 @@ app.post('/get-rate', async (req, res) => {
         });
         console.log('[GET-RATE] ← DHL:', JSON.stringify(dhlRes.data, null, 2));
         const prods = Array.isArray(dhlRes.data?.products) ? dhlRes.data.products : [];
-        rateList = prods.map((p) => ({
-          carrier:        order.carrier || 'DHLEC',
-          shippingOption: p.orderedProductId || p.productId || p.productName || 'GND',
-          totalCost:      parseFloat(p.rateDetails?.totalAmount  || p.rateDetails?.baseAmount || 0),
-          shippingCost:   parseFloat(p.rateDetails?.baseAmount   || 0),
-          otherCost:      parseFloat(p.rateDetails?.otherAmount  || 0),
-          currency:       order.currency || 'USD',
-        }));
+    rateList = prods.map((p) => ({
+  carrier:        order.carrier || 'DHLEC',
+  shippingOption: p.orderedProductId || p.productId || p.productName || 'GND',
+  totalCost:      parseFloat(p.rate?.amount || 0),
+  shippingCost:   parseFloat(p.rate?.amount || 0),
+  otherCost:      0,
+  currency:       p.rate?.currency || order.currency || 'USD',
+}));
         if (!rateList.length) msg = 'No DHL rates available for this route';
       } catch (e) {
         msg = e.response?.data?.invalidParams
