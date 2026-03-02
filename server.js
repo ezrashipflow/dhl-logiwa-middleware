@@ -170,7 +170,11 @@ app.post('/get-rate', async (req, res) => {
         },
         returnAddress: buildReturnAddress(order.shipFrom),
         distributionCenter: DHL_DISTRIBUTION,
-        pickup: DHL_PICKUP_ID,
+         pickup: DHL_PICKUP_ID,
+        rate: {
+          calculate: true,
+          currency: order.currency || 'USD',
+        },
         packageDetail: {
           packageId:          `RATE-${(order.shipmentOrderCode || '').replace(/[^A-Za-z0-9]/g,'')}-${Date.now()}`.slice(0, 30),
           packageDescription: order.shipmentOrderCode || 'Shipment',
@@ -181,7 +185,6 @@ app.post('/get-rate', async (req, res) => {
           }),
         },
       };
-
       console.log('[GET-RATE] → DHL:', JSON.stringify(dhlReq, null, 2));
       let rateList = [], msg = '';
 
