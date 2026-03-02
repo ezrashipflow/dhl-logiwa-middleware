@@ -302,7 +302,7 @@ app.post('/create-label', async (req, res) => {
       console.log('[CREATE-LABEL] → DHL:', JSON.stringify(dhlReq, null, 2));
 
       try {
-        const dhlRes  = await axios.post(`${DHL_BASE_URL}/shipping/v4/labels`, dhlReq, {
+        const dhlRes  = await axios.post(`${DHL_BASE_URL}/shipping/v4/label`, dhlReq, {
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         });
         const d   = dhlRes.data;
@@ -373,7 +373,7 @@ app.post('/void-label', async (req, res) => {
       const trk = order.masterTrackingNumber;
       if (!trk) { out.push({ shipmentOrderIdentifier: order.shipmentOrderIdentifier, masterTrackingNumber:'', isSuccessful:false, message:'No tracking number' }); continue; }
       try {
-        await axios.delete(`${DHL_BASE_URL}/shipping/v4/labels/${trk}`, { headers: { Authorization:`Bearer ${token}` } });
+        await axios.delete(`${DHL_BASE_URL}/shipping/v4/label/${trk}`, { headers: { Authorization:`Bearer ${token}` } });
         out.push({ shipmentOrderIdentifier:order.shipmentOrderIdentifier, masterTrackingNumber:trk, isSuccessful:true, message:'Voided' });
       } catch (e) {
         const alreadyVoided = e.response?.status === 404;
