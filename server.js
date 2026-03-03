@@ -50,7 +50,6 @@ function parseLogiwaBody(body) {
   return Array.isArray(body) ? body : [body];
 }
 
-// Logiwa address fields are PascalCase, nested under .address
 function getAddr(obj) {
   if (!obj) return {};
   const a = obj.address || obj;
@@ -83,7 +82,6 @@ function weightToLB(value, unit) {
   else if (u === 'G')  lb = v / 453.592;
   else if (u === 'KG') lb = v * 2.20462;
   else lb = v;
-  // DHL requires weight as a multiple of 0.01 — round UP to 2 decimal places
   return Math.max(Math.ceil(lb * 100) / 100, 0.01);
 }
 
@@ -109,7 +107,6 @@ function mapServiceToDHL(s) {
   return s;
 }
 
-// Default return/ship-from address (fallback if Logiwa doesn't send it)
 const DEFAULT_FROM = {
   name: 'ShipFlow',
   address1: '625 JERSEY AVE STE 9', address2: '',
@@ -121,15 +118,15 @@ function buildReturnAddress(shipFrom) {
   const a = getAddr(shipFrom);
   const c = getContact(shipFrom);
   return {
-    name:       c.name    || DEFAULT_FROM.name,
+    name:       c.name       || DEFAULT_FROM.name,
     address1:   a.address1   || DEFAULT_FROM.address1,
     address2:   a.address2   || DEFAULT_FROM.address2,
     city:       a.city       || DEFAULT_FROM.city,
     state:      a.state      || DEFAULT_FROM.state,
     postalCode: a.postalCode || DEFAULT_FROM.postalCode,
     country:    a.country    || DEFAULT_FROM.country,
-    phone:      c.phone || DEFAULT_FROM.phone,
-    email:      c.email || DEFAULT_FROM.email,
+    phone:      c.phone      || DEFAULT_FROM.phone,
+    email:      c.email      || DEFAULT_FROM.email,
   };
 }
 
@@ -137,7 +134,7 @@ function buildReturnAddress(shipFrom) {
 app.get('/', (req, res) => res.json({
   status: 'running',
   service: 'DHL eCommerce <-> Logiwa Middleware',
-  version: '2.0.0',
+  version: '2.0.1',
 }));
 
 // ─── 1. GET RATE ────────────────────────────────────────────────────────────────
@@ -149,11 +146,11 @@ app.post('/get-rate', async (req, res) => {
     const out    = [];
 
     for (const order of orders) {
-      const pkg      = order.requestedPackageLineItems?.[0] || {};
-      const shipTo   = getAddr(order.shipTo);
+      const pkg       = order.requestedPackageLineItems?.[0] || {};
+      const shipTo    = getAddr(order.shipTo);
       const toContact = getContact(order.shipTo);
-      const weightLB = weightToLB(pkg.weight?.Value || pkg.weight?.value, pkg.weight?.Units || pkg.weight?.units);
-      const dims     = pkg.dimensions || {};
+      const weightLB  = weightToLB(pkg.weight?.Value || pkg.weight?.value, pkg.weight?.Units || pkg.weight?.units);
+      const dims      = pkg.dimensions || {};
       const l = parseFloat(dims.Length || dims.length || 0);
       const w = parseFloat(dims.Width  || dims.width  || 0);
       const h = parseFloat(dims.Height || dims.height || 0);
@@ -170,7 +167,7 @@ app.post('/get-rate', async (req, res) => {
         },
         returnAddress: buildReturnAddress(order.shipFrom),
         distributionCenter: DHL_DISTRIBUTION,
-         pickup: DHL_PICKUP_ID,
+        pickup: DHL_PICKUP_ID,
         rate: {
           calculate: true,
           currency: order.currency || 'USD',
@@ -185,23 +182,24 @@ app.post('/get-rate', async (req, res) => {
           }),
         },
       };
+
       console.log('[GET-RATE] → DHL:', JSON.stringify(dhlReq, null, 2));
       let rateList = [], msg = '';
-      
+
       try {
-        const dhlRes  = await axios.post(`${DHL_BASE_URL}/shipping/v4/products`, dhlReq, {
+        const dhlRes = await axios.post(`${DHL_BASE_URL}/shipping/v4/products`, dhlReq, {
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         });
         console.log('[GET-RATE] ← DHL:', JSON.stringify(dhlRes.data, null, 2));
         const prods = Array.isArray(dhlRes.data?.products) ? dhlRes.data.products : [];
-    rateList = prods.map((p) => ({
-  carrier:        order.carrier || 'DHLEC',
-  shippingOption: p.orderedProductId || p.productId || p.productName || 'GND',
-  totalCost:      parseFloat(p.rate?.amount || 0),
-  shippingCost:   parseFloat(p.rate?.amount || 0),
-  otherCost:      0,
-  currency:       p.rate?.currency || order.currency || 'USD',
-}));
+        rateList = prods.map((p) => ({
+          carrier:        order.carrier || 'DHLEC',
+          shippingOption: p.orderedProductId || p.productId || p.productName || 'GND',
+          totalCost:      parseFloat(p.rate?.amount || 0),
+          shippingCost:   parseFloat(p.rate?.amount || 0),
+          otherCost:      0,
+          currency:       p.rate?.currency || order.currency || 'USD',
+        }));
         if (!rateList.length) msg = 'No DHL rates available for this route';
       } catch (e) {
         msg = e.response?.data?.invalidParams
@@ -219,10 +217,9 @@ app.post('/get-rate', async (req, res) => {
       });
     }
 
-    // Logiwa sends an array but expects a single object back
     const result = out.length === 1 ? out[0] : out[0];
     console.log('[GET-RATE] → Logiwa:', JSON.stringify([result], null, 2));
-return res.json({ data: [result] });
+    return res.json({ data: [result] });
   } catch (err) {
     console.error('[GET-RATE] Fatal:', err.message);
     return res.json(parseLogiwaBody(req.body).map((o) => ({
@@ -281,6 +278,7 @@ app.post('/create-label', async (req, res) => {
           phone:       toContact.phone   || '',
           email:       toContact.email   || '',
         },
+      };
 
       // International customs
       const customs = order.internationalOptions?.customsItems;
@@ -298,7 +296,7 @@ app.post('/create-label', async (req, res) => {
       console.log('[CREATE-LABEL] → DHL:', JSON.stringify(dhlReq, null, 2));
 
       try {
-        const dhlRes  = await axios.post(`${DHL_BASE_URL}/shipping/v4/label`, dhlReq, {
+        const dhlRes = await axios.post(`${DHL_BASE_URL}/shipping/v4/label`, dhlReq, {
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         });
         const d   = dhlRes.data;
@@ -316,9 +314,9 @@ app.post('/create-label', async (req, res) => {
             labelURL:       d.labelUrl || '',
           }],
           rateDetail: {
-            totalCost:    parseFloat(d.rateDetails?.totalAmount  || 0),
-            shippingCost: parseFloat(d.rateDetails?.baseAmount   || 0),
-            otherCost:    parseFloat(d.rateDetails?.otherAmount  || 0),
+            totalCost:    parseFloat(d.rateDetails?.totalAmount || 0),
+            shippingCost: parseFloat(d.rateDetails?.baseAmount  || 0),
+            otherCost:    parseFloat(d.rateDetails?.otherAmount || 0),
             currency:     order.currency || 'USD',
           },
           masterTrackingNumber: trk,
@@ -331,7 +329,7 @@ app.post('/create-label', async (req, res) => {
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
           shipmentOrderCode:       order.shipmentOrderCode,
-          carrier: order.carrier || 'DHLEC',
+          carrier:        order.carrier || 'DHLEC',
           shippingOption: order.shippingOption,
           packageResponse: [],
           rateDetail: { totalCost:0, shippingCost:0, otherCost:0, currency:'USD' },
@@ -348,7 +346,7 @@ app.post('/create-label', async (req, res) => {
     const o = parseLogiwaBody(req.body)[0] || {};
     return res.json({
       shipmentOrderIdentifier: o.shipmentOrderIdentifier,
-      shipmentOrderCode: o.shipmentOrderCode,
+      shipmentOrderCode:       o.shipmentOrderCode,
       carrier: o.carrier || 'DHLEC', shippingOption: o.shippingOption,
       packageResponse: [],
       rateDetail: { totalCost:0, shippingCost:0, otherCost:0, currency:'USD' },
@@ -367,7 +365,10 @@ app.post('/void-label', async (req, res) => {
     const out    = [];
     for (const order of orders) {
       const trk = order.masterTrackingNumber;
-      if (!trk) { out.push({ shipmentOrderIdentifier: order.shipmentOrderIdentifier, masterTrackingNumber:'', isSuccessful:false, message:'No tracking number' }); continue; }
+      if (!trk) {
+        out.push({ shipmentOrderIdentifier: order.shipmentOrderIdentifier, masterTrackingNumber:'', isSuccessful:false, message:'No tracking number' });
+        continue;
+      }
       try {
         await axios.delete(`${DHL_BASE_URL}/shipping/v4/label/${trk}`, { headers: { Authorization:`Bearer ${token}` } });
         out.push({ shipmentOrderIdentifier:order.shipmentOrderIdentifier, masterTrackingNumber:trk, isSuccessful:true, message:'Voided' });
