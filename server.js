@@ -1,13 +1,6 @@
 /**
- * DHL eCommerce Americas <-> Logiwa Custom Carrier Middleware v2
- *
- * Key fixes in this version:
- *  - Logiwa sends requests as a JSON ARRAY [{...}] — now handled correctly
- *  - Address fields are PascalCase: AddressLine1, City, StateOrProvinceCode, etc.
- *  - Weight field keys are PascalCase: Units, Value
- *  - DHL requires returnAddress, packageId, packageDescription in every request
- *  - Weight auto-converted from OZ/G/KG → LB for DHL
- *  - Responses returned as arrays to match Logiwa's format
+ * DHL eCommerce Americas <-> Logiwa Custom Carrier Middleware v2.0.2
+ * Logging reduced to prevent Railway 500/sec rate limit from hiding errors
  */
 
 const express = require('express');
@@ -29,7 +22,6 @@ const DHL_BASE_URL = 'https://api.dhlecs.com';
 let cachedToken = null;
 let tokenExpiry = 0;
 
-// ─── Auth ───────────────────────────────────────────────────────────────────────
 async function getDHLToken() {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
   const params = new URLSearchParams();
@@ -43,8 +35,6 @@ async function getDHLToken() {
   console.log('[AUTH] DHL token refreshed');
   return cachedToken;
 }
-
-// ─── Helpers ────────────────────────────────────────────────────────────────────
 
 function parseLogiwaBody(body) {
   return Array.isArray(body) ? body : [body];
@@ -91,15 +81,9 @@ function mapServiceToDHL(s) {
   const map = {
     'GND': 'GND', 'GROUND': 'GND',
     'EXP': 'EXP', 'EXPEDITED': 'EXP',
-    'MAX': 'MAX',
-    'BGN': 'BGN',
-    'BEX': 'BEX',
-    'PLT': 'PLT',
-    'PLY': 'PLY',
-    'PKY': 'PKY',
-    'RGN': 'RGN',
-    'RPL': 'RPL',
-    'RLT': 'RLT',
+    'MAX': 'MAX', 'BGN': 'BGN', 'BEX': 'BEX',
+    'PLT': 'PLT', 'PLY': 'PLY', 'PKY': 'PKY',
+    'RGN': 'RGN', 'RPL': 'RPL', 'RLT': 'RLT',
   };
   for (const [key, val] of Object.entries(map)) {
     if (u === key || u.includes(key)) return val;
@@ -130,16 +114,14 @@ function buildReturnAddress(shipFrom) {
   };
 }
 
-// ─── Health ─────────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({
   status: 'running',
   service: 'DHL eCommerce <-> Logiwa Middleware',
-  version: '2.0.1',
+  version: '2.0.2',
 }));
 
 // ─── 1. GET RATE ────────────────────────────────────────────────────────────────
 app.post('/get-rate', async (req, res) => {
-  console.log('[GET-RATE] Body:', JSON.stringify(req.body, null, 2));
   try {
     const token  = await getDHLToken();
     const orders = parseLogiwaBody(req.body);
@@ -168,10 +150,7 @@ app.post('/get-rate', async (req, res) => {
         returnAddress: buildReturnAddress(order.shipFrom),
         distributionCenter: DHL_DISTRIBUTION,
         pickup: DHL_PICKUP_ID,
-        rate: {
-          calculate: true,
-          currency: order.currency || 'USD',
-        },
+        rate: { calculate: true, currency: order.currency || 'USD' },
         packageDetail: {
           packageId:          `RATE-${(order.shipmentOrderCode || '').replace(/[^A-Za-z0-9]/g,'')}-${Date.now()}`.slice(0, 30),
           packageDescription: order.shipmentOrderCode || 'Shipment',
@@ -183,14 +162,11 @@ app.post('/get-rate', async (req, res) => {
         },
       };
 
-      console.log('[GET-RATE] → DHL:', JSON.stringify(dhlReq, null, 2));
       let rateList = [], msg = '';
-
       try {
         const dhlRes = await axios.post(`${DHL_BASE_URL}/shipping/v4/products`, dhlReq, {
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         });
-        console.log('[GET-RATE] ← DHL:', JSON.stringify(dhlRes.data, null, 2));
         const prods = Array.isArray(dhlRes.data?.products) ? dhlRes.data.products : [];
         rateList = prods.map((p) => ({
           carrier:        order.carrier || 'DHLEC',
@@ -200,12 +176,13 @@ app.post('/get-rate', async (req, res) => {
           otherCost:      0,
           currency:       p.rate?.currency || order.currency || 'USD',
         }));
+        console.log(`[GET-RATE] OK ${order.shipmentOrderCode} - ${rateList.length} rates`);
         if (!rateList.length) msg = 'No DHL rates available for this route';
       } catch (e) {
         msg = e.response?.data?.invalidParams
           ? `DHL validation: ${JSON.stringify(e.response.data.invalidParams)}`
           : `DHL error: ${e.response?.data?.detail || e.message}`;
-        console.error('[GET-RATE] DHL fail:', msg);
+        console.error('[GET-RATE] FAIL:', msg);
       }
 
       out.push({
@@ -217,9 +194,7 @@ app.post('/get-rate', async (req, res) => {
       });
     }
 
-    const result = out.length === 1 ? out[0] : out[0];
-    console.log('[GET-RATE] → Logiwa:', JSON.stringify([result], null, 2));
-    return res.json({ data: [result] });
+    return res.json({ data: [out[0]] });
   } catch (err) {
     console.error('[GET-RATE] Fatal:', err.message);
     return res.json(parseLogiwaBody(req.body).map((o) => ({
@@ -233,7 +208,6 @@ app.post('/get-rate', async (req, res) => {
 
 // ─── 2. CREATE LABEL ────────────────────────────────────────────────────────────
 app.post('/create-label', async (req, res) => {
-  console.log('[CREATE-LABEL] Body:', JSON.stringify(req.body, null, 2));
   try {
     const token  = await getDHLToken();
     const orders = parseLogiwaBody(req.body);
@@ -283,17 +257,18 @@ app.post('/create-label', async (req, res) => {
       // International customs
       const customs = order.internationalOptions?.customsItems;
       if (Array.isArray(customs) && customs.length > 0) {
-      dhlReq.customsDetails = customs.map((item) => ({
-        itemDescription:  item.description || 'Merchandise',
-        packagedQuantity: parseInt(item.quantity) || 1,
-        itemValue:        parseFloat(item.declaredValue) || 0,
-        currency:         order.currency || 'USD',
-        countryOfOrigin:  item.originCountryCode || 'US',
-        ...(item.hsTariffCode && { hsCode: item.hsTariffCode }),
-      }));
+        dhlReq.customsDetails = customs.map((item) => ({
+          itemDescription:  item.description || 'Merchandise',
+          packagedQuantity: parseInt(item.quantity) || 1,
+          itemValue:        parseFloat(item.declaredValue) || 0,
+          currency:         order.currency || 'USD',
+          countryOfOrigin:  item.originCountryCode || 'US',
+          ...(item.hsTariffCode && { hsCode: item.hsTariffCode }),
+        }));
       }
 
-      console.log('[CREATE-LABEL] → DHL:', JSON.stringify(dhlReq, null, 2));
+      console.log(`[CREATE-LABEL] order=${order.shipmentOrderCode} service=${dhlReq.orderedProductId} weight=${weightLB}LB`);
+      console.log('[CREATE-LABEL] DHL body:', JSON.stringify(dhlReq));
 
       try {
         const dhlRes = await axios.post(`${DHL_BASE_URL}/shipping/v4/label?format=PDF`, dhlReq, {
@@ -301,7 +276,7 @@ app.post('/create-label', async (req, res) => {
         });
         const d   = dhlRes.data;
         const trk = d.dhlPackageId || d.packageId || packageId;
-        console.log('[CREATE-LABEL] Success, tracking:', trk);
+        console.log('[CREATE-LABEL] SUCCESS tracking:', trk, 'keys:', Object.keys(d).join(','));
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
           shipmentOrderCode:       order.shipmentOrderCode,
@@ -324,8 +299,9 @@ app.post('/create-label', async (req, res) => {
           message: '',
         });
       } catch (e) {
-        const em = e.response?.data?.detail || e.message;
-        console.error('[CREATE-LABEL] DHL fail:', em, JSON.stringify(e.response?.data, null, 2));
+        const errData = e.response?.data;
+        console.error(`[CREATE-LABEL] DHL FAIL status=${e.response?.status} body=${JSON.stringify(errData)}`);
+        const em = errData?.detail || errData?.title || e.message;
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
           shipmentOrderCode:       order.shipmentOrderCode,
@@ -358,7 +334,6 @@ app.post('/create-label', async (req, res) => {
 
 // ─── 3. VOID LABEL ──────────────────────────────────────────────────────────────
 app.post('/void-label', async (req, res) => {
-  console.log('[VOID-LABEL] Body:', JSON.stringify(req.body, null, 2));
   try {
     const token  = await getDHLToken();
     const orders = parseLogiwaBody(req.body);
@@ -386,7 +361,6 @@ app.post('/void-label', async (req, res) => {
 
 // ─── 4. END-OF-DAY REPORT ───────────────────────────────────────────────────────
 app.post('/end-of-day-report', async (req, res) => {
-  console.log('[EOD-REPORT] Body:', JSON.stringify(req.body, null, 2));
   try {
     const token = await getDHLToken();
     const body  = Array.isArray(req.body) ? req.body[0] : req.body;
@@ -402,7 +376,6 @@ app.post('/end-of-day-report', async (req, res) => {
   }
 });
 
-// ─── Start ───────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n🚀 DHL-Logiwa Middleware v2 on port ${PORT}\n`);
+  console.log(`\n🚀 DHL-Logiwa Middleware v2.0.2 on port ${PORT}\n`);
 });
