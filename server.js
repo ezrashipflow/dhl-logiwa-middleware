@@ -319,7 +319,7 @@ labelURL:       label?.labelUrl || d.labelUrl || '',
       }
     }
 
-    return res.json({ data: out.length === 1 ? out[0] : out[0] });
+      return res.json({ data: [out[0]] });
   } catch (err) {
     console.error('[CREATE-LABEL] Fatal:', err.message);
     const o = parseLogiwaBody(req.body)[0] || {};
