@@ -276,8 +276,10 @@ if (isInternational && Array.isArray(customs) && customs.length > 0) {
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         });
         const d   = dhlRes.data;
-        const trk = d.dhlPackageId || d.packageId || packageId;
+        const label = Array.isArray(d.labels) ? d.labels[0] : null;
+const trk = label?.dhlPackageId || label?.packageId || d.dhlPackageId || d.packageId || packageId;
         console.log('[CREATE-LABEL] SUCCESS tracking:', trk, 'keys:', Object.keys(d).join(','));
+        console.log('[CREATE-LABEL] DHL labels:', JSON.stringify(d.labels));
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
           shipmentOrderCode:       order.shipmentOrderCode,
@@ -286,8 +288,8 @@ if (isInternational && Array.isArray(customs) && customs.length > 0) {
           packageResponse: [{
             packageSequenceNumber: pkg.packageSequenceNumber || 1,
             trackingNumber: trk,
-            encodedLabel:   labelFmt !== 'zpl' ? (d.labelData || '') : Buffer.from(d.labelData || '').toString('base64'),
-            labelURL:       d.labelUrl || '',
+            encodedLabel:   label?.labelData || d.labelData || '',
+labelURL:       label?.labelUrl || d.labelUrl || '',
           }],
           rateDetail: {
             totalCost:    parseFloat(d.rateDetails?.totalAmount || 0),
