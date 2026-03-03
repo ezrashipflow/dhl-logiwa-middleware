@@ -256,7 +256,8 @@ app.post('/create-label', async (req, res) => {
 
       // International customs
       const customs = order.internationalOptions?.customsItems;
-      if (Array.isArray(customs) && customs.length > 0) {
+const isInternational = (shipTo.country || 'US').toUpperCase() !== 'US';
+if (isInternational && Array.isArray(customs) && customs.length > 0) {
         dhlReq.customsDetails = customs.map((item) => ({
           itemDescription:  item.description || 'Merchandise',
           packagedQuantity: parseInt(item.quantity) || 1,
