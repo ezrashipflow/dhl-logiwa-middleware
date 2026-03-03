@@ -284,18 +284,19 @@ app.post('/create-label', async (req, res) => {
       const customs = order.internationalOptions?.customsItems;
       if (Array.isArray(customs) && customs.length > 0) {
       dhlReq.customsDetails = customs.map((item) => ({
-  itemDescription:  item.description || 'Merchandise',
-  packagedQuantity: parseInt(item.quantity) || 1,
-  itemValue:        parseFloat(item.declaredValue) || 0,
-  currency:         order.currency || 'USD',
-  countryOfOrigin:  item.originCountryCode || 'US',
-}));
+        itemDescription:  item.description || 'Merchandise',
+        packagedQuantity: parseInt(item.quantity) || 1,
+        itemValue:        parseFloat(item.declaredValue) || 0,
+        currency:         order.currency || 'USD',
+        countryOfOrigin:  item.originCountryCode || 'US',
+        ...(item.hsTariffCode && { hsCode: item.hsTariffCode }),
+      }));
       }
 
       console.log('[CREATE-LABEL] → DHL:', JSON.stringify(dhlReq, null, 2));
 
       try {
-        const dhlRes = await axios.post(`${DHL_BASE_URL}/shipping/v4/label`, dhlReq, {
+        const dhlRes = await axios.post(`${DHL_BASE_URL}/shipping/v4/label?format=PDF`, dhlReq, {
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         });
         const d   = dhlRes.data;
