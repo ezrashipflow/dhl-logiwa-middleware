@@ -288,9 +288,7 @@ app.post('/create-label', async (req, res) => {
   packagedQuantity: parseInt(item.quantity) || 1,
   itemValue:        parseFloat(item.declaredValue) || 0,
   currency:         order.currency || 'USD',
-  weight:           parseFloat(item.weight) || weightLB,
   countryOfOrigin:  item.originCountryCode || 'US',
-  hsTariffCode:     item.hsTariffCode || '',
 }));
       }
 
