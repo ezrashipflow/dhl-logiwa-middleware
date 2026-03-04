@@ -325,7 +325,9 @@ message: [],
       }
     }
 
-      return res.json({ data: [out[0]] });
+      const logiwaResponse = { data: [out[0]] };
+console.log('[CREATE-LABEL] → Logiwa:', JSON.stringify(logiwaResponse));
+return res.json(logiwaResponse);
   } catch (err) {
     console.error('[CREATE-LABEL] Fatal:', err.message);
     const o = parseLogiwaBody(req.body)[0] || {};
