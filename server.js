@@ -285,21 +285,27 @@ const trk = label?.dhlPackageId || label?.packageId || d.dhlPackageId || d.packa
           shipmentOrderCode:       order.shipmentOrderCode,
           carrier:                 order.carrier || 'DHLEC',
           shippingOption:          order.shippingOption,
-          packageResponse: [{
-            packageSequenceNumber: pkg.packageSequenceNumber || 1,
-            trackingNumber: trk,
-            encodedLabel:   label?.labelData || d.labelData || '',
-labelURL:       label?.labelUrl || d.labelUrl || '',
-          }],
-          rateDetail: {
-            totalCost:    parseFloat(d.rateDetails?.totalAmount || 0),
-            shippingCost: parseFloat(d.rateDetails?.baseAmount  || 0),
-            otherCost:    parseFloat(d.rateDetails?.otherAmount || 0),
-            currency:     order.currency || 'USD',
-          },
-          masterTrackingNumber: trk,
-          isSuccessful: true,
-          message: '',
+         packageResponse: [{
+  packageSequenceNumber: pkg.packageSequenceNumber || 1,
+  trackingNumber: trk,
+  encodedLabel:   label?.labelData || d.labelData || '',
+  labelUrl:       label?.labelUrl || d.labelUrl || '',
+  rateDetail: {
+    totalCost:    parseFloat(d.rateDetails?.totalAmount || 0),
+    shippingCost: parseFloat(d.rateDetails?.baseAmount  || 0),
+    otherCost:    parseFloat(d.rateDetails?.otherAmount || 0),
+    currency:     order.currency || 'USD',
+  },
+}],
+rateDetail: {
+  totalCost:    parseFloat(d.rateDetails?.totalAmount || 0),
+  shippingCost: parseFloat(d.rateDetails?.baseAmount  || 0),
+  otherCost:    parseFloat(d.rateDetails?.otherAmount || 0),
+  currency:     order.currency || 'USD',
+},
+masterTrackingNumber: trk,
+isSuccessful: true,
+message: [],
         });
       } catch (e) {
         const errData = e.response?.data;
