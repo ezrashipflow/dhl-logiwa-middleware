@@ -288,7 +288,7 @@ const trk = label?.dhlPackageId || label?.packageId || d.dhlPackageId || d.packa
          packageResponse: [{
   packageSequenceNumber: pkg.packageSequenceNumber || 1,
   trackingNumber: trk,
-  encodedLabel:   label?.labelData || d.labelData || '',
+  encodedLabel: `data:application/pdf;base64,${label?.labelData || d.labelData || ''}`,
   labelUrl:       label?.labelUrl || d.labelUrl || '',
   rateDetail: {
     totalCost:    parseFloat(d.rateDetails?.totalAmount || 0),
