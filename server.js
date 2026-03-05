@@ -291,7 +291,6 @@ const trk = label?.dhlPackageId || label?.packageId || d.dhlPackageId || d.packa
   encodedLabel:   label?.labelData || d.labelData || '',
   labelURL:       label?.labelUrl || d.labelUrl || '',
 }],
-}],
 rateDetail: {
   totalCost:    parseFloat(d.rateDetails?.totalAmount || 0),
   shippingCost: parseFloat(d.rateDetails?.baseAmount  || 0),
