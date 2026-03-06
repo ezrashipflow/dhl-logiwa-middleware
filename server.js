@@ -1,8 +1,8 @@
 /**
- * DHL eCommerce Americas <-> Logiwa Custom Carrier Middleware v2.0.2
- * Logging reduced to prevent Railway 500/sec rate limit from hiding errors
+ * DHL eCommerce Americas <-> Logiwa Custom Carrier Middleware v2.0.3
+ * Added: in-memory label cache + /label/:id proxy endpoint so Logiwa can
+ * fetch labels without DHL Bearer token authentication.
  */
-
 const express = require('express');
 const axios = require('axios');
 require('dotenv').config();
@@ -14,16 +14,21 @@ const DHL_CLIENT_ID     = process.env.DHL_CLIENT_ID;
 const DHL_CLIENT_SECRET = process.env.DHL_CLIENT_SECRET;
 const DHL_PICKUP_ID     = process.env.DHL_PICKUP_ID;
 const DHL_DISTRIBUTION  = process.env.DHL_DISTRIBUTION;
-const PORT              = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
 
 const DHL_AUTH_URL = 'https://api.dhlecs.com/auth/v4/accesstoken';
 const DHL_BASE_URL = 'https://api.dhlecs.com';
 
-let cachedToken = null;
-let tokenExpiry = 0;
+// Middleware public URL (used to build label proxy URLs)
+const MIDDLEWARE_URL = process.env.RAILWAY_PUBLIC_DOMAIN
+  ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+  : (process.env.MIDDLEWARE_URL || 'https://dhl-logiwa-middleware-production.up.railway.app');
 
-// In-memory label cache: trackingNumber -> base64 PDF data
+// In-memory label cache: { [packageId]: { labelData, encodeType, format } }
 const labelCache = {};
+
+let cachedToken = null;
+let tokenExpiry  = 0;
 
 async function getDHLToken() {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
@@ -34,14 +39,12 @@ async function getDHLToken() {
     auth: { username: DHL_CLIENT_ID, password: DHL_CLIENT_SECRET },
   });
   cachedToken = r.data.access_token;
-  tokenExpiry = Date.now() + 55 * 60 * 1000;
+  tokenExpiry  = Date.now() + 55 * 60 * 1000;
   console.log('[AUTH] DHL token refreshed');
   return cachedToken;
 }
 
-function parseLogiwaBody(body) {
-  return Array.isArray(body) ? body : [body];
-}
+function parseLogiwaBody(body) { return Array.isArray(body) ? body : [body]; }
 
 function getAddr(obj) {
   if (!obj) return {};
@@ -60,10 +63,10 @@ function getContact(obj) {
   if (!obj) return {};
   const c = obj.contact || obj;
   return {
-    name:    c.personName    || c.name    || '',
-    company: c.companyName   || c.company || '',
-    phone:   c.phoneNumber   || c.phone   || '',
-    email:   c.emailAddress  || c.email   || '',
+    name:    c.personName   || c.name    || '',
+    company: c.companyName  || c.company || '',
+    phone:   c.phoneNumber  || c.phone   || '',
+    email:   c.emailAddress || c.email   || '',
   };
 }
 
@@ -71,10 +74,10 @@ function weightToLB(value, unit) {
   const v = parseFloat(value) || 0;
   const u = (unit || 'LB').toUpperCase();
   let lb;
-  if (u === 'OZ') lb = v / 16;
+  if      (u === 'OZ') lb = v / 16;
   else if (u === 'G')  lb = v / 453.592;
   else if (u === 'KG') lb = v * 2.20462;
-  else lb = v;
+  else                 lb = v;
   return Math.max(Math.ceil(lb * 100) / 100, 0.01);
 }
 
@@ -82,11 +85,9 @@ function mapServiceToDHL(s) {
   if (!s) return 'GND';
   const u = s.toUpperCase();
   const map = {
-    'GND': 'GND', 'GROUND': 'GND',
-    'EXP': 'EXP', 'EXPEDITED': 'EXP',
-    'MAX': 'MAX', 'BGN': 'BGN', 'BEX': 'BEX',
-    'PLT': 'PLT', 'PLY': 'PLY', 'PKY': 'PKY',
-    'RGN': 'RGN', 'RPL': 'RPL', 'RLT': 'RLT',
+    'GND':'GND','GROUND':'GND','EXP':'EXP','EXPEDITED':'EXP',
+    'MAX':'MAX','BGN':'BGN','BEX':'BEX','PLT':'PLT','PLY':'PLY',
+    'PKY':'PKY','RGN':'RGN','RPL':'RPL','RLT':'RLT',
   };
   for (const [key, val] of Object.entries(map)) {
     if (u === key || u.includes(key)) return val;
@@ -95,10 +96,9 @@ function mapServiceToDHL(s) {
 }
 
 const DEFAULT_FROM = {
-  name: 'ShipFlow',
-  address1: '625 JERSEY AVE STE 9', address2: '',
-  city: 'NEW BRUNSWICK', state: 'NJ', postalCode: '08901', country: 'US',
-  phone: '9085253857', email: 'info@shipflow.co',
+  name:'ShipFlow', address1:'625 JERSEY AVE STE 9', address2:'',
+  city:'NEW BRUNSWICK', state:'NJ', postalCode:'08901', country:'US',
+  phone:'9085253857', email:'info@shipflow.co',
 };
 
 function buildReturnAddress(shipFrom) {
@@ -117,25 +117,34 @@ function buildReturnAddress(shipFrom) {
   };
 }
 
+// ─── HEALTH CHECK ──────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({
   status: 'running',
   service: 'DHL eCommerce <-> Logiwa Middleware',
-  version: '2.0.2',
+  version: '2.0.3',
 }));
 
-
-// ─── LABEL PROXY ────────────────────────────────────────────────────────────────
-// Serves cached label PDFs so Logiwa can fetch them without DHL auth
+// ─── LABEL PROXY ──────────────────────────────────────────────────────────────
+// Serves cached PDF labels without requiring DHL Bearer token.
+// Logiwa fetches labelUrl which points here instead of DHL API.
 app.get('/label/:id', (req, res) => {
-  const entry = labelCache[req.params.id];
-  if (!entry) return res.status(404).json({ error: 'Label not found' });
-  const buf = Buffer.from(entry.labelData, 'base64');
-  res.set('Content-Type', 'application/pdf');
-  res.set('Content-Disposition', `inline; filename="${req.params.id}.pdf"`);
+  const cached = labelCache[req.params.id];
+  if (!cached) {
+    console.log(`[LABEL-PROXY] Miss for id=${req.params.id}`);
+    return res.status(404).json({ error: 'Label not found', id: req.params.id });
+  }
+  const buf = Buffer.from(cached.labelData, 'base64');
+  const fmt = (cached.format || 'pdf').toLowerCase();
+  const contentType = fmt === 'zpl' ? 'application/x-zebra-zpl'
+    : fmt === 'png' ? 'image/png'
+    : 'application/pdf';
+  console.log(`[LABEL-PROXY] Serving label id=${req.params.id} size=${buf.length}`);
+  res.setHeader('Content-Type', contentType);
+  res.setHeader('Content-Disposition', `inline; filename="${req.params.id}.${fmt}"`);
   res.send(buf);
 });
 
-// ─── 1. GET RATE ────────────────────────────────────────────────────────────────
+// ─── 1. GET RATE ──────────────────────────────────────────────────────────────
 app.post('/get-rate', async (req, res) => {
   try {
     const token  = await getDHLToken();
@@ -147,7 +156,7 @@ app.post('/get-rate', async (req, res) => {
       const shipTo    = getAddr(order.shipTo);
       const toContact = getContact(order.shipTo);
       const weightLB  = weightToLB(pkg.weight?.Value || pkg.weight?.value, pkg.weight?.Units || pkg.weight?.units);
-      const dims      = pkg.dimensions || {};
+      const dims = pkg.dimensions || {};
       const l = parseFloat(dims.Length || dims.length || 0);
       const w = parseFloat(dims.Width  || dims.width  || 0);
       const h = parseFloat(dims.Height || dims.height || 0);
@@ -162,17 +171,16 @@ app.post('/get-rate', async (req, res) => {
           postalCode: shipTo.postalCode,
           country:    shipTo.country    || 'US',
         },
-        returnAddress: buildReturnAddress(order.shipFrom),
+        returnAddress:      buildReturnAddress(order.shipFrom),
         distributionCenter: DHL_DISTRIBUTION,
-        pickup: DHL_PICKUP_ID,
-        rate: { calculate: true, currency: order.currency || 'USD' },
+        pickup:             DHL_PICKUP_ID,
+        rate:      { calculate: true, currency: order.currency || 'USD' },
         packageDetail: {
-          packageId:          `RATE-${(order.shipmentOrderCode || '').replace(/[^A-Za-z0-9]/g,'')}-${Date.now()}`.slice(0, 30),
+          packageId:          `RATE-${(order.shipmentOrderCode||'').replace(/[^A-Za-z0-9]/g,'')}-${Date.now()}`.slice(0,30),
           packageDescription: order.shipmentOrderCode || 'Shipment',
           weight: { unitOfMeasure: 'LB', value: weightLB },
           ...(l > 0 && w > 0 && h > 0 && {
-            dimension: { length: l, width: w, height: h,
-              unitOfMeasure: (dims.Units || dims.units || 'IN').toUpperCase() },
+            dimension: { length:l, width:w, height:h, unitOfMeasure:(dims.Units||dims.units||'IN').toUpperCase() },
           }),
         },
       };
@@ -180,7 +188,7 @@ app.post('/get-rate', async (req, res) => {
       let rateList = [], msg = '';
       try {
         const dhlRes = await axios.post(`${DHL_BASE_URL}/shipping/v4/products`, dhlReq, {
-          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          headers: { Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
         });
         const prods = Array.isArray(dhlRes.data?.products) ? dhlRes.data.products : [];
         rateList = prods.map((p) => ({
@@ -205,7 +213,7 @@ app.post('/get-rate', async (req, res) => {
         shipmentOrderIdentifier: order.shipmentOrderIdentifier,
         rateList,
         isSuccessful: rateList.length > 0,
-        message: msg,
+        message:      msg,
       });
     }
 
@@ -213,15 +221,16 @@ app.post('/get-rate', async (req, res) => {
   } catch (err) {
     console.error('[GET-RATE] Fatal:', err.message);
     return res.json(parseLogiwaBody(req.body).map((o) => ({
-      shipmentOrderCode: o.shipmentOrderCode,
+      shipmentOrderCode:       o.shipmentOrderCode,
       shipmentOrderIdentifier: o.shipmentOrderIdentifier,
-      rateList: [], isSuccessful: false,
-      message: `Middleware error: ${err.message}`,
+      rateList:    [],
+      isSuccessful: false,
+      message:     `Middleware error: ${err.message}`,
     })));
   }
 });
 
-// ─── 2. CREATE LABEL ────────────────────────────────────────────────────────────
+// ─── 2. CREATE LABEL ──────────────────────────────────────────────────────────
 app.post('/create-label', async (req, res) => {
   try {
     const token  = await getDHLToken();
@@ -236,40 +245,39 @@ app.post('/create-label', async (req, res) => {
       const weightLB  = weightToLB(pkg.weight?.Value || pkg.weight?.value, pkg.weight?.Units || pkg.weight?.units);
       const packageId = `${(order.shipmentOrderCode||'').replace(/[^A-Za-z0-9]/g,'')}-${Date.now()}`.slice(0,40);
       const labelFmt  = { PDF:'pdf', ZPL:'zpl', PNG:'png' }[(labelSpec.labelFileType||'').toUpperCase()] || 'pdf';
-      const dims      = pkg.dimensions || {};
+      const dims = pkg.dimensions || {};
       const l = parseFloat(dims.Length || dims.length || 0);
       const w = parseFloat(dims.Width  || dims.width  || 0);
       const h = parseFloat(dims.Height || dims.height || 0);
 
       const dhlReq = {
-        pickup: DHL_PICKUP_ID,
+        pickup:             DHL_PICKUP_ID,
         distributionCenter: DHL_DISTRIBUTION,
-        orderedProductId: mapServiceToDHL(order.shippingOption),
-        returnAddress: buildReturnAddress(order.shipFrom),
+        orderedProductId:   mapServiceToDHL(order.shippingOption),
+        returnAddress:      buildReturnAddress(order.shipFrom),
         packageDetail: {
           packageId,
           packageDescription: order.shipmentOrderCode || 'Shipment',
           weight: { unitOfMeasure: 'LB', value: weightLB },
           ...(l > 0 && w > 0 && h > 0 && {
-            dimension: { length: l, width: w, height: h,
-              unitOfMeasure: (dims.Units || dims.units || 'IN').toUpperCase() },
+            dimension: { length:l, width:w, height:h, unitOfMeasure:(dims.Units||dims.units||'IN').toUpperCase() },
           }),
         },
         consigneeAddress: {
-          name:        toContact.name    || '',
-          companyName: toContact.company || '',
-          address1:    shipTo.address1   || '',
-          address2:    shipTo.address2   || '',
-          city:        shipTo.city       || '',
-          state:       shipTo.state      || '',
-          postalCode:  shipTo.postalCode || '',
-          country:     shipTo.country    || 'US',
-          phone:       toContact.phone   || '',
-          email:       toContact.email   || '',
+          name:       toContact.name    || '',
+          companyName:toContact.company || '',
+          address1:   shipTo.address1   || '',
+          address2:   shipTo.address2   || '',
+          city:       shipTo.city       || '',
+          state:      shipTo.state      || '',
+          postalCode: shipTo.postalCode || '',
+          country:    shipTo.country    || 'US',
+          phone:      toContact.phone   || '',
+          email:      toContact.email   || '',
         },
       };
 
-      // International customs — only include for non-US destinations
+      // International customs
       const isInternational = (shipTo.country || 'US').toUpperCase() !== 'US';
       const customs = order.internationalOptions?.customsItems;
       if (isInternational && Array.isArray(customs) && customs.length > 0) {
@@ -284,48 +292,61 @@ app.post('/create-label', async (req, res) => {
       }
 
       console.log(`[CREATE-LABEL] order=${order.shipmentOrderCode} service=${dhlReq.orderedProductId} weight=${weightLB}LB`);
-      console.log('[CREATE-LABEL] DHL body:', JSON.stringify(dhlReq));
 
       try {
         const dhlRes = await axios.post(`${DHL_BASE_URL}/shipping/v4/label?format=PDF`, dhlReq, {
-          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          headers: { Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
         });
+
         const d     = dhlRes.data;
         const label = Array.isArray(d.labels) ? d.labels[0] : d;
         const trk   = label.dhlPackageId || label.packageId || packageId;
-        console.log('[CREATE-LABEL] SUCCESS tracking:', trk, 'keys:', Object.keys(d).join(','));
-        console.log('[CREATE-LABEL] label keys:', Object.keys(label).join(','));
-        labelCache[label.dhlPackageId] = { labelData: label.labelData || '' };
-        const MIDDLEWARE_URL = process.env.RAILWAY_PUBLIC_DOMAIN
-          ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
-          : 'https://dhl-logiwa-middleware-production.up.railway.app';
+        const cacheKey = trk;
+
+        console.log(`[CREATE-LABEL] SUCCESS tracking=${trk} keys=${Object.keys(d).join(',')}`);
+
+        // Cache the label data so /label/:id can serve it without auth
+        if (label.labelData) {
+          labelCache[cacheKey] = {
+            labelData:  label.labelData,
+            encodeType: label.encodeType || 'BASE64',
+            format:     labelFmt,
+          };
+          console.log(`[CREATE-LABEL] Cached label for key=${cacheKey}`);
+        }
+
+        const proxyLabelUrl = `${MIDDLEWARE_URL}/label/${cacheKey}`;
+
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
           shipmentOrderCode:       order.shipmentOrderCode,
-          carrier:                 order.carrier || 'DHLEC',
-          shippingOption:          order.shippingOption,
+          carrier:        order.carrier || 'DHLEC',
+          shippingOption: order.shippingOption,
           packageResponse: [{
             packageSequenceNumber: pkg.packageSequenceNumber || 1,
-            trackingNumber: trk,
-            encodedLabel:   label.labelData || '',
-            labelUrl:       `${MIDDLEWARE_URL}/label/${label.dhlPackageId}`,
+            trackingNumber:        trk,
+            encodedLabel:          label.labelData || '',
+            labelUrl:              proxyLabelUrl,
+            trackingUrl:           null,
             rateDetail: {
-              totalCost:    parseFloat(d.rateDetails?.totalAmount || 0),
-              shippingCost: parseFloat(d.rateDetails?.baseAmount  || 0),
-              otherCost:    parseFloat(d.rateDetails?.otherAmount || 0),
-              currency:     order.currency || 'USD',
+              totalCost:   parseFloat(d.rateDetails?.totalAmount || 0),
+              shippingCost:parseFloat(d.rateDetails?.baseAmount  || 0),
+              otherCost:   parseFloat(d.rateDetails?.otherAmount  || 0),
+              currency:    order.currency || 'USD',
             },
+            externalReference: packageId,
           }],
           rateDetail: {
-            totalCost:    parseFloat(d.rateDetails?.totalAmount || 0),
-            shippingCost: parseFloat(d.rateDetails?.baseAmount  || 0),
-            otherCost:    parseFloat(d.rateDetails?.otherAmount || 0),
-            currency:     order.currency || 'USD',
+            totalCost:   parseFloat(d.rateDetails?.totalAmount || 0),
+            shippingCost:parseFloat(d.rateDetails?.baseAmount  || 0),
+            otherCost:   parseFloat(d.rateDetails?.otherAmount  || 0),
+            currency:    order.currency || 'USD',
           },
           masterTrackingNumber: trk,
           isSuccessful: true,
-          message: [],
+          message:      [],
         });
+
       } catch (e) {
         const errData = e.response?.data;
         console.error(`[CREATE-LABEL] DHL FAIL status=${e.response?.status} body=${JSON.stringify(errData)}`);
@@ -333,63 +354,71 @@ app.post('/create-label', async (req, res) => {
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
           shipmentOrderCode:       order.shipmentOrderCode,
-          carrier:        order.carrier || 'DHLEC',
-          shippingOption: order.shippingOption,
+          carrier:         order.carrier || 'DHLEC',
+          shippingOption:  order.shippingOption,
           packageResponse: [],
           rateDetail: { totalCost:0, shippingCost:0, otherCost:0, currency:'USD' },
           masterTrackingNumber: '',
           isSuccessful: false,
-          message: `DHL error: ${em}`,
+          message:      `DHL error: ${em}`,
         });
       }
     }
 
     const logiwaResponse = { data: [out[0]] };
-    console.log('[CREATE-LABEL] → Logiwa:', JSON.stringify(logiwaResponse));
+    console.log('[CREATE-LABEL] → Logiwa labelUrl:', out[0]?.packageResponse?.[0]?.labelUrl);
     return res.json(logiwaResponse);
+
   } catch (err) {
     console.error('[CREATE-LABEL] Fatal:', err.message);
     const o = parseLogiwaBody(req.body)[0] || {};
     return res.json({
       shipmentOrderIdentifier: o.shipmentOrderIdentifier,
       shipmentOrderCode:       o.shipmentOrderCode,
-      carrier: o.carrier || 'DHLEC', shippingOption: o.shippingOption,
+      carrier:         o.carrier || 'DHLEC',
+      shippingOption:  o.shippingOption,
       packageResponse: [],
       rateDetail: { totalCost:0, shippingCost:0, otherCost:0, currency:'USD' },
-      masterTrackingNumber: '', isSuccessful: false,
-      message: `Middleware error: ${err.message}`,
+      masterTrackingNumber: '',
+      isSuccessful: false,
+      message:      `Middleware error: ${err.message}`,
     });
   }
 });
 
-// ─── 3. VOID LABEL ──────────────────────────────────────────────────────────────
+// ─── 3. VOID LABEL ────────────────────────────────────────────────────────────
 app.post('/void-label', async (req, res) => {
   try {
     const token  = await getDHLToken();
     const orders = parseLogiwaBody(req.body);
     const out    = [];
+
     for (const order of orders) {
       const trk = order.masterTrackingNumber;
       if (!trk) {
-        out.push({ shipmentOrderIdentifier: order.shipmentOrderIdentifier, masterTrackingNumber:'', isSuccessful:false, message:'No tracking number' });
+        out.push({ shipmentOrderIdentifier:order.shipmentOrderIdentifier, masterTrackingNumber:'', isSuccessful:false, message:'No tracking number' });
         continue;
       }
       try {
-        await axios.delete(`${DHL_BASE_URL}/shipping/v4/label/${trk}`, { headers: { Authorization:`Bearer ${token}` } });
+        await axios.delete(`${DHL_BASE_URL}/shipping/v4/label/${trk}`, {
+          headers: { Authorization:`Bearer ${token}` },
+        });
+        // Remove from cache
+        delete labelCache[trk];
         out.push({ shipmentOrderIdentifier:order.shipmentOrderIdentifier, masterTrackingNumber:trk, isSuccessful:true, message:'Voided' });
       } catch (e) {
         const alreadyVoided = e.response?.status === 404;
-        out.push({ shipmentOrderIdentifier:order.shipmentOrderIdentifier, masterTrackingNumber:trk, isSuccessful:alreadyVoided, message: alreadyVoided ? 'Already voided' : `DHL error: ${e.message}` });
+        out.push({ shipmentOrderIdentifier:order.shipmentOrderIdentifier, masterTrackingNumber:trk, isSuccessful:alreadyVoided, message:alreadyVoided?'Already voided':`DHL error: ${e.message}` });
       }
     }
-    return res.json(out.length === 1 ? out[0] : out[0]);
+    return res.json(out[0]);
   } catch (err) {
     const o = parseLogiwaBody(req.body)[0] || {};
     return res.json({ shipmentOrderIdentifier:o.shipmentOrderIdentifier, masterTrackingNumber:o.masterTrackingNumber||'', isSuccessful:false, message:`Error: ${err.message}` });
   }
 });
 
-// ─── 4. END-OF-DAY REPORT ───────────────────────────────────────────────────────
+// ─── 4. END-OF-DAY REPORT ─────────────────────────────────────────────────────
 app.post('/end-of-day-report', async (req, res) => {
   try {
     const token = await getDHLToken();
@@ -399,7 +428,13 @@ app.post('/end-of-day-report', async (req, res) => {
       { pickup: DHL_PICKUP_ID, closeDate },
       { headers: { Authorization:`Bearer ${token}`, 'Content-Type':'application/json' } }
     );
-    return res.json({ carrierSetupIdentifier:body.carrierSetupIdentifier, carrier:body.carrier||'DHLEC', encodedReport:Buffer.from(JSON.stringify(dhlRes.data)).toString('base64'), isSuccessful:true, message:'' });
+    return res.json({
+      carrierSetupIdentifier: body.carrierSetupIdentifier,
+      carrier:        body.carrier || 'DHLEC',
+      encodedReport:  Buffer.from(JSON.stringify(dhlRes.data)).toString('base64'),
+      isSuccessful:   true,
+      message:        '',
+    });
   } catch (err) {
     const b = Array.isArray(req.body) ? req.body[0] : req.body;
     return res.json({ carrierSetupIdentifier:b.carrierSetupIdentifier, carrier:b.carrier||'DHLEC', encodedReport:'', isSuccessful:false, message:`Error: ${err.message}` });
@@ -407,5 +442,6 @@ app.post('/end-of-day-report', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`\n🚀 DHL-Logiwa Middleware v2.0.2 on port ${PORT}\n`);
+  console.log(`\n🚀 DHL-Logiwa Middleware v2.0.3 on port ${PORT}`);
+  console.log(`   Label proxy: ${MIDDLEWARE_URL}/label/:id\n`);
 });
