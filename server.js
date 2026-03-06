@@ -275,9 +275,11 @@ app.post('/create-label', async (req, res) => {
         const dhlRes = await axios.post(`${DHL_BASE_URL}/shipping/v4/label?format=PDF`, dhlReq, {
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         });
-        const d   = dhlRes.data;
-        const trk = d.dhlPackageId || d.packageId || packageId;
+        const d     = dhlRes.data;
+        const label = Array.isArray(d.labels) ? d.labels[0] : d;
+        const trk   = label.dhlPackageId || label.packageId || packageId;
         console.log('[CREATE-LABEL] SUCCESS tracking:', trk, 'keys:', Object.keys(d).join(','));
+        console.log('[CREATE-LABEL] label keys:', Object.keys(label).join(','));
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
           shipmentOrderCode:       order.shipmentOrderCode,
@@ -286,8 +288,8 @@ app.post('/create-label', async (req, res) => {
           packageResponse: [{
             packageSequenceNumber: pkg.packageSequenceNumber || 1,
             trackingNumber: trk,
-            encodedLabel:   labelFmt !== 'zpl' ? (d.labelData || '') : Buffer.from(d.labelData || '').toString('base64'),
-            labelUrl:       d.labelUrl || d.link || '',
+            encodedLabel:   label.labelData || '',
+            labelUrl:       label.link || label.labelUrl || '',
             rateDetail: {
               totalCost:    parseFloat(d.rateDetails?.totalAmount || 0),
               shippingCost: parseFloat(d.rateDetails?.baseAmount  || 0),
