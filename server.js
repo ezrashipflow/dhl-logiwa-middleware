@@ -117,7 +117,7 @@ function buildReturnAddress(shipFrom) {
 app.get('/', (req, res) => res.json({
   status: 'running',
   service: 'DHL eCommerce <-> Logiwa Middleware',
-  version: '2.0.3',
+  version: '2.0.2',
 }));
 
 // ─── 1. GET RATE ────────────────────────────────────────────────────────────────
@@ -256,8 +256,7 @@ app.post('/create-label', async (req, res) => {
 
       // International customs
       const customs = order.internationalOptions?.customsItems;
-      const isInternational = (shipTo.country || 'US').toUpperCase() !== 'US';
-      if (isInternational && Array.isArray(customs) && customs.length > 0) {
+      if (Array.isArray(customs) && customs.length > 0) {
         dhlReq.customsDetails = customs.map((item) => ({
           itemDescription:  item.description || 'Merchandise',
           packagedQuantity: parseInt(item.quantity) || 1,
@@ -275,11 +274,9 @@ app.post('/create-label', async (req, res) => {
         const dhlRes = await axios.post(`${DHL_BASE_URL}/shipping/v4/label?format=PDF`, dhlReq, {
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         });
-        const d     = dhlRes.data;
-        const label = Array.isArray(d.labels) ? d.labels[0] : null;
-        const trk   = label?.dhlPackageId || label?.packageId || d.dhlPackageId || d.packageId || packageId;
+        const d   = dhlRes.data;
+        const trk = d.dhlPackageId || d.packageId || packageId;
         console.log('[CREATE-LABEL] SUCCESS tracking:', trk, 'keys:', Object.keys(d).join(','));
-        console.log('[CREATE-LABEL] DHL labels:', JSON.stringify(d.labels));
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
           shipmentOrderCode:       order.shipmentOrderCode,
@@ -288,8 +285,14 @@ app.post('/create-label', async (req, res) => {
           packageResponse: [{
             packageSequenceNumber: pkg.packageSequenceNumber || 1,
             trackingNumber: trk,
-            encodedLabel:   label?.labelData || d.labelData || '',
-            labelURL:       label?.labelUrl  || d.labelUrl  || '',
+            encodedLabel:   labelFmt !== 'zpl' ? (d.labelData || '') : Buffer.from(d.labelData || '').toString('base64'),
+            labelUrl:       d.labelUrl || d.link || '',
+            rateDetail: {
+              totalCost:    parseFloat(d.rateDetails?.totalAmount || 0),
+              shippingCost: parseFloat(d.rateDetails?.baseAmount  || 0),
+              otherCost:    parseFloat(d.rateDetails?.otherAmount || 0),
+              currency:     order.currency || 'USD',
+            },
           }],
           rateDetail: {
             totalCost:    parseFloat(d.rateDetails?.totalAmount || 0),
@@ -322,22 +325,17 @@ app.post('/create-label', async (req, res) => {
     const logiwaResponse = { data: [out[0]] };
     console.log('[CREATE-LABEL] → Logiwa:', JSON.stringify(logiwaResponse));
     return res.json(logiwaResponse);
-
   } catch (err) {
     console.error('[CREATE-LABEL] Fatal:', err.message);
     const o = parseLogiwaBody(req.body)[0] || {};
     return res.json({
-      data: [{
-        shipmentOrderIdentifier: o.shipmentOrderIdentifier,
-        shipmentOrderCode:       o.shipmentOrderCode,
-        carrier:                 o.carrier || 'DHLEC',
-        shippingOption:          o.shippingOption,
-        packageResponse: [],
-        rateDetail: { totalCost:0, shippingCost:0, otherCost:0, currency:'USD' },
-        masterTrackingNumber: '',
-        isSuccessful: false,
-        message: `Middleware error: ${err.message}`,
-      }],
+      shipmentOrderIdentifier: o.shipmentOrderIdentifier,
+      shipmentOrderCode:       o.shipmentOrderCode,
+      carrier: o.carrier || 'DHLEC', shippingOption: o.shippingOption,
+      packageResponse: [],
+      rateDetail: { totalCost:0, shippingCost:0, otherCost:0, currency:'USD' },
+      masterTrackingNumber: '', isSuccessful: false,
+      message: `Middleware error: ${err.message}`,
     });
   }
 });
@@ -387,5 +385,5 @@ app.post('/end-of-day-report', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`\n🚀 DHL-Logiwa Middleware v2.0.3 on port ${PORT}\n`);
+  console.log(`\n🚀 DHL-Logiwa Middleware v2.0.2 on port ${PORT}\n`);
 });
