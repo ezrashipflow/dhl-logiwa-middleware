@@ -22,6 +22,9 @@ const DHL_BASE_URL = 'https://api.dhlecs.com';
 let cachedToken = null;
 let tokenExpiry = 0;
 
+// In-memory label cache: trackingNumber -> base64 PDF data
+const labelCache = {};
+
 async function getDHLToken() {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
   const params = new URLSearchParams();
@@ -119,6 +122,18 @@ app.get('/', (req, res) => res.json({
   service: 'DHL eCommerce <-> Logiwa Middleware',
   version: '2.0.2',
 }));
+
+
+// ─── LABEL PROXY ────────────────────────────────────────────────────────────────
+// Serves cached label PDFs so Logiwa can fetch them without DHL auth
+app.get('/label/:id', (req, res) => {
+  const entry = labelCache[req.params.id];
+  if (!entry) return res.status(404).json({ error: 'Label not found' });
+  const buf = Buffer.from(entry.labelData, 'base64');
+  res.set('Content-Type', 'application/pdf');
+  res.set('Content-Disposition', `inline; filename="${req.params.id}.pdf"`);
+  res.send(buf);
+});
 
 // ─── 1. GET RATE ────────────────────────────────────────────────────────────────
 app.post('/get-rate', async (req, res) => {
@@ -280,6 +295,10 @@ app.post('/create-label', async (req, res) => {
         const trk   = label.dhlPackageId || label.packageId || packageId;
         console.log('[CREATE-LABEL] SUCCESS tracking:', trk, 'keys:', Object.keys(d).join(','));
         console.log('[CREATE-LABEL] label keys:', Object.keys(label).join(','));
+        labelCache[label.dhlPackageId] = { labelData: label.labelData || '' };
+        const MIDDLEWARE_URL = process.env.RAILWAY_PUBLIC_DOMAIN
+          ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+          : 'https://dhl-logiwa-middleware-production.up.railway.app';
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
           shipmentOrderCode:       order.shipmentOrderCode,
@@ -289,7 +308,7 @@ app.post('/create-label', async (req, res) => {
             packageSequenceNumber: pkg.packageSequenceNumber || 1,
             trackingNumber: trk,
             encodedLabel:   label.labelData || '',
-            labelUrl:       label.link || label.labelUrl || '',
+            labelUrl:       `${MIDDLEWARE_URL}/label/${label.dhlPackageId}`,
             rateDetail: {
               totalCost:    parseFloat(d.rateDetails?.totalAmount || 0),
               shippingCost: parseFloat(d.rateDetails?.baseAmount  || 0),
