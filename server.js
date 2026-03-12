@@ -44,7 +44,8 @@ function logRequest(tag, method, url, headers, body) {
 
 function logResponse(tag, status, data) {
   console.log(`[${tag}] ◄ RESPONSE status=${status}`);
-  console.log(`[${tag}]   BODY:\n${JSON.stringify(data, null, 2)}`);
+  const body = JSON.stringify(data, null, 2);
+  console.log(`[${tag}]   BODY:\n${body.slice(0, 1000)}${body.length > 1000 ? '\n...[truncated]' : ''}`);
   console.log(`${'─'.repeat(60)}\n`);
 }
 
