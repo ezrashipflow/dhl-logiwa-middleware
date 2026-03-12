@@ -412,7 +412,7 @@ app.post('/create-label', async (req, res) => {
           packageResponse: [{
             packageSequenceNumber: pkg.packageSequenceNumber || 1,
             trackingNumber:        trk,
-            encodedLabel:          '',           // ← intentionally blank; Logiwa uses labelUrl
+            encodedLabel: label.labelData || '',
             labelUrl:              proxyLabelUrl,
             trackingUrl:           null,
             rateDetail: {
