@@ -410,12 +410,14 @@ const packageId = `${(order.shipmentOrderCode||'').replace(/[^A-Za-z0-9]/g,'').s
           shipmentOrderCode:       order.shipmentOrderCode,
           carrier:        order.carrier || 'DHLEC',
           shippingOption: order.shippingOption,
-          packageResponse: [{
-            packageSequenceNumber: pkg.packageSequenceNumber || 1,
-            trackingNumber:        trk,
-            encodedLabel: '',
-            labelUrl:              proxyLabelUrl,
-            trackingUrl:           null,
+         packageResponse: [{
+  packageSequenceNumber: pkg.packageSequenceNumber || 1,
+  trackingNumber:        trk,
+  encodedLabel:          label.labelData || '',
+  encodeType:            label.encodeType || 'BASE64',
+  labelFormat:           labelFmt.toUpperCase(),
+  labelUrl:              proxyLabelUrl,
+  trackingUrl:           null,
             rateDetail: {
               totalCost:    parseFloat(d.rateDetails?.totalAmount || 0),
               shippingCost: parseFloat(d.rateDetails?.baseAmount  || 0),
