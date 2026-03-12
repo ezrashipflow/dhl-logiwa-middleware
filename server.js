@@ -413,7 +413,7 @@ const packageId = `${(order.shipmentOrderCode||'').replace(/[^A-Za-z0-9]/g,'').s
           packageResponse: [{
             packageSequenceNumber: pkg.packageSequenceNumber || 1,
             trackingNumber:        trk,
-            encodedLabel: label.labelData || '',
+            encodedLabel: '',
             labelUrl:              proxyLabelUrl,
             trackingUrl:           null,
             rateDetail: {
