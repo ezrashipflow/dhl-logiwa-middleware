@@ -411,7 +411,7 @@ const packageId = `${(order.shipmentOrderCode||'').replace(/[^A-Za-z0-9]/g,'').s
           carrier:        order.carrier || 'DHLEC',
           shippingOption: order.shippingOption,
          packageResponse: [{
-  packageSequenceNumber: pkg.packageSequenceNumber || 1,
+  packageSequenceNumber: pkg.packageSequenceNumber || 0,
 trackingNumber:        trk,
 encodedLabel:          label.labelData || '',
 labelURL:              proxyLabelUrl,
