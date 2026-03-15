@@ -502,28 +502,62 @@ app.post('/end-of-day-report', async (req, res) => {
   try {
     const token = await getDHLToken();
     const body  = Array.isArray(req.body) ? req.body[0] : req.body;
-    const closeDate = body.closeDate || new Date().toISOString().split('T')[0];
-    const manifestUrl = `${DHL_BASE_URL}/shipping/v4/manifests`;
-    const manifestReq = { pickup: DHL_PICKUP_ID, closeDate };
-    logRequest('EOD', 'POST', manifestUrl, { Authorization: 'Bearer ***', 'Content-Type': 'application/json' }, manifestReq);
-    const dhlRes = await axios.post(manifestUrl, manifestReq, { headers: { Authorization:`Bearer ${token}`, 'Content-Type':'application/json' } });
-    logResponse('EOD', dhlRes.status, dhlRes.data);
+
+    // Step 1 — POST to create the manifest
+    const manifestReq = { pickup: DHL_PICKUP_ID, manifests: [] };
+    const createUrl = `${DHL_BASE_URL}/shipping/v4/manifest`;
+    logRequest('EOD', 'POST', createUrl, { Authorization: 'Bearer ***', 'Content-Type': 'application/json' }, manifestReq);
+
+    const createRes = await axios.post(createUrl, manifestReq, {
+      headers: { Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
+    });
+    logResponse('EOD', createRes.status, createRes.data);
+
+    const { requestId, link } = createRes.data;
+    console.log(`[EOD] Manifest created → requestId=${requestId} link=${link}`);
+
+    // Step 2 — Poll GET until status is no longer CREATED
+    let manifestData = null;
+    let attempts = 0;
+    while (attempts < 10) {
+      await new Promise(r => setTimeout(r, 2000)); // wait 2s between polls
+      attempts++;
+      console.log(`[EOD] Polling manifest status attempt ${attempts}...`);
+      const getRes = await axios.get(link, {
+        headers: { Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
+      });
+      logResponse('EOD', getRes.status, getRes.data);
+      if (getRes.data.status !== 'CREATED') {
+        manifestData = getRes.data;
+        break;
+      }
+    }
+
+    if (!manifestData) {
+      manifestData = { requestId, status: 'CREATED', link };
+      console.warn('[EOD] ⚠ Manifest still processing after 10 attempts — returning partial data');
+    }
+
+    // Encode the manifest data as base64 for Logiwa
+    const encodedReport = Buffer.from(JSON.stringify(manifestData)).toString('base64');
+
     return res.json({
       carrierSetupIdentifier: body.carrierSetupIdentifier,
       carrier:        body.carrier || 'DHLEC',
-      encodedReport:  Buffer.from(JSON.stringify(dhlRes.data)).toString('base64'),
+      encodedReport,
       isSuccessful:   true,
       message:        '',
     });
+
   } catch (err) {
     logError('EOD', err);
     const b = Array.isArray(req.body) ? req.body[0] : req.body;
-    return res.json({ carrierSetupIdentifier:b.carrierSetupIdentifier, carrier:b.carrier||'DHLEC', encodedReport:'', isSuccessful:false, message:`Error: ${err.message}` });
+    return res.json({
+      carrierSetupIdentifier: b.carrierSetupIdentifier,
+      carrier: b.carrier || 'DHLEC',
+      encodedReport: '',
+      isSuccessful: false,
+      message: `Error: ${err.message}`
+    });
   }
-});
-
-app.listen(PORT, () => {
-  console.log(`\n🚀 DHL-Logiwa Middleware v2.2.0 on port ${PORT}`);
-  console.log(`   Label proxy : ${MIDDLEWARE_URL}/label/:id`);
-  console.log(`   Env check   : PICKUP=${DHL_PICKUP_ID} DIST=${DHL_DISTRIBUTION}\n`);
 });
