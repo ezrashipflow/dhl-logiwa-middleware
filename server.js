@@ -500,12 +500,13 @@ app.post('/void-label', async (req, res) => {
 
     for (const order of orders) {
       const trk = order.masterTrackingNumber;
+const dhlPackageId = order.externalReference || labelCache[trk]?.originalPackageId || trk;
       if (!trk) {
         out.push({ shipmentOrderIdentifier:order.shipmentOrderIdentifier, masterTrackingNumber:'', isSuccessful:false, message:'No tracking number' });
         continue;
       }
 
-      const voidUrl = `${DHL_BASE_URL}/shipping/v4/label/${trk}`;
+      const voidUrl = `${DHL_BASE_URL}/shipping/v4/label/${dhlPackageId}`;
       logRequest('VOID-LABEL', 'DELETE', voidUrl, { Authorization: 'Bearer ***' }, null);
 
       try {
