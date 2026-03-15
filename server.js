@@ -506,7 +506,7 @@ const dhlPackageId = order.externalReference || labelCache[trk]?.originalPackage
         continue;
       }
 
-      const voidUrl = `${DHL_BASE_URL}/shipping/v4/label/${dhlPackageId}?pickup=${DHL_PICKUP_ID}`;
+      const voidUrl = `${DHL_BASE_URL}/shipping/v4/label/${DHL_PICKUP_ID}?packageId=${dhlPackageId}`;
       logRequest('VOID-LABEL', 'DELETE', voidUrl, { Authorization: 'Bearer ***' }, null);
 
       try {
