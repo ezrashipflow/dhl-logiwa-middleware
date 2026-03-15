@@ -513,9 +513,14 @@ const dhlPackageId = order.externalReference || labelCache[trk]?.originalPackage
         const dhlRes = await axios.delete(voidUrl, {
           headers: { Authorization:`Bearer ${token}` },
         });
-        logResponse('VOID-LABEL', dhlRes.status, dhlRes.data);
-        delete labelCache[trk];
-        out.push({ shipmentOrderIdentifier:order.shipmentOrderIdentifier, masterTrackingNumber:trk, isSuccessful:true, message:'Voided' });
+       logResponse('VOID-LABEL', dhlRes.status, dhlRes.data);
+  delete labelCache[trk];
+out.push({ 
+  shipmentOrderIdentifier: order.shipmentOrderIdentifier, 
+  masterTrackingNumber: order.masterTrackingNumber,
+  isSuccessful: true, 
+  message: '' 
+});
       } catch (e) {
         logError('VOID-LABEL', e);
         const alreadyVoided = e.response?.status === 404;
