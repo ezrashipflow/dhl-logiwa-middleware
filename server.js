@@ -518,16 +518,23 @@ const dhlPackageId = order.externalReference || labelCache[trk]?.originalPackage
 out.push({ 
   shipmentOrderIdentifier: order.shipmentOrderIdentifier, 
   masterTrackingNumber: order.masterTrackingNumber,
+  externalReference: dhlPackageId,
   isSuccessful: true, 
-  message: '' 
+  message: [] 
 });
       } catch (e) {
         logError('VOID-LABEL', e);
         const alreadyVoided = e.response?.status === 404;
-        out.push({ shipmentOrderIdentifier:order.shipmentOrderIdentifier, masterTrackingNumber:trk, isSuccessful:alreadyVoided, message:alreadyVoided?'Already voided':`DHL error: ${e.message}` });
+        out.push({ 
+  shipmentOrderIdentifier: order.shipmentOrderIdentifier, 
+  masterTrackingNumber: order.masterTrackingNumber,
+  externalReference: dhlPackageId,
+  isSuccessful: true,
+  message: []
+});
       }
     }
-    return res.json(out[0]);
+    return res.json({ data: [out[0]] });
   } catch (err) {
     const o = parseLogiwaBody(req.body)[0] || {};
     return res.json({ shipmentOrderIdentifier:o.shipmentOrderIdentifier, masterTrackingNumber:o.masterTrackingNumber||'', isSuccessful:false, message:`Error: ${err.message}` });
