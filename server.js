@@ -240,7 +240,7 @@ if (prods.length > 0) console.log('[GET-RATE] Product sample:', JSON.stringify(p
           shippingCost:   parseFloat(p.rate?.amount || 0),
           otherCost:      0,
           currency:       p.rate?.currency || order.currency || 'USD',
-          deliveryDays:   parseInt(p.deliveryCommitment?.totalTransitDays, 10) || null,
+          estimatedDays:   parseInt(p.deliveryCommitment?.totalTransitDays, 10) || null,
         }));
         console.log('[GET-RATE] OK ' + order.shipmentOrderCode + ' - ' + rateList.length + ' rates found');
         if (!rateList.length) msg = 'No DHL rates available for this route';
