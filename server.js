@@ -231,6 +231,7 @@ app.post('/get-rate', async (req, res) => {
         });
         logResponse('GET-RATE', dhlRes.status, dhlRes.data);
         const prods = Array.isArray(dhlRes.data?.products) ? dhlRes.data.products : [];
+if (prods.length > 0) console.log('[GET-RATE] Product sample:', JSON.stringify(prods[0], null, 2));
         // FIX: added deliveryDays from DHL deliveryCommitment.totalTransitDays
         rateList = prods.map((p) => ({
           carrier:        order.carrier || 'DHLEC',
