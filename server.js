@@ -1,9 +1,7 @@
 /**
- * DHL eCommerce Americas <-> Logiwa Custom Carrier Middleware v2.4.0
- * Changes from v2.3.0:
- *   - estimatedDeliveryDate: { calculate: true } added to rate request body
- *   - deliveryDays renamed to estimatedDays (Logiwa field name)
- *   - version bumped, debug log line removed
+ * DHL eCommerce Americas <-> Logiwa Custom Carrier Middleware v2.4.1
+ * Changes from v2.4.0:
+ *   - Added debug logs to identify DHL transit day field location
  */
 const express = require('express');
 const axios = require('axios');
@@ -163,7 +161,7 @@ function buildReturnAddress(shipFrom) {
 app.get('/', (req, res) => res.json({
   status: 'running',
   service: 'DHL eCommerce <-> Logiwa Middleware',
-  version: '2.4.0',
+  version: '2.4.1',
 }));
 
 app.get('/label/:id', (req, res) => {
@@ -213,7 +211,6 @@ app.post('/get-rate', async (req, res) => {
         distributionCenter: DHL_DISTRIBUTION,
         pickup:             DHL_PICKUP_ID,
         rate:               { calculate: true, currency: order.currency || 'USD' },
-        // FIX: request estimated delivery date so DHL returns transit days
         estimatedDeliveryDate: { calculate: true },
         packageDetail: {
           packageId:          ('RATE-' + (order.shipmentOrderCode||'').replace(/[^A-Za-z0-9]/g,'') + '-' + Date.now()).slice(0,30),
@@ -233,6 +230,11 @@ app.post('/get-rate', async (req, res) => {
         });
         logResponse('GET-RATE', dhlRes.status, dhlRes.data);
         const prods = Array.isArray(dhlRes.data?.products) ? dhlRes.data.products : [];
+
+        // DEBUG: log full first product and top-level estimatedDeliveryDate to find transit day field
+        if (prods.length > 0) console.log('[GET-RATE] DEBUG product[0]:', JSON.stringify(prods[0], null, 2));
+        console.log('[GET-RATE] DEBUG estimatedDeliveryDate:', JSON.stringify(dhlRes.data?.estimatedDeliveryDate, null, 2));
+
         rateList = prods.map((p) => ({
           carrier:        order.carrier || 'DHLEC',
           shippingOption: p.orderedProductId || p.productId || p.productName || 'GND',
@@ -240,7 +242,6 @@ app.post('/get-rate', async (req, res) => {
           shippingCost:   parseFloat(p.rate?.amount || 0),
           otherCost:      0,
           currency:       p.rate?.currency || order.currency || 'USD',
-          // FIX: estimatedDays is the correct Logiwa field name
           estimatedDays:  parseInt(p.deliveryCommitment?.totalTransitDays, 10) || null,
         }));
         console.log('[GET-RATE] OK ' + order.shipmentOrderCode + ' - ' + rateList.length + ' rates found');
@@ -562,7 +563,7 @@ app.post('/end-of-day-report', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log('\n🚀 DHL eCommerce-Logiwa Middleware v2.4.0 on port ' + PORT);
+  console.log('\n🚀 DHL eCommerce-Logiwa Middleware v2.4.1 on port ' + PORT);
   console.log('   Label proxy  : ' + MIDDLEWARE_URL + '/label/:id');
   console.log('   Pickup ID    : ' + DHL_PICKUP_ID);
   console.log('   Distribution : ' + DHL_DISTRIBUTION);
