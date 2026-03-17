@@ -1,9 +1,9 @@
 /**
- * DHL eCommerce Americas <-> Logiwa Custom Carrier Middleware v2.3.0
- * Changes from v2.2.0:
- *   - deliveryDays added to rateList (from p.deliveryCommitment.totalTransitDays)
- *   - message field is now always an array in all error paths (Logiwa requirement)
- *   - Fatal catch in /get-rate now wraps response in { data: [...] }
+ * DHL eCommerce Americas <-> Logiwa Custom Carrier Middleware v2.4.0
+ * Changes from v2.3.0:
+ *   - estimatedDeliveryDate: { calculate: true } added to rate request body
+ *   - deliveryDays renamed to estimatedDays (Logiwa field name)
+ *   - version bumped, debug log line removed
  */
 const express = require('express');
 const axios = require('axios');
@@ -163,7 +163,7 @@ function buildReturnAddress(shipFrom) {
 app.get('/', (req, res) => res.json({
   status: 'running',
   service: 'DHL eCommerce <-> Logiwa Middleware',
-  version: '2.3.0',
+  version: '2.4.0',
 }));
 
 app.get('/label/:id', (req, res) => {
@@ -212,7 +212,9 @@ app.post('/get-rate', async (req, res) => {
         returnAddress:      buildReturnAddress(order.shipFrom),
         distributionCenter: DHL_DISTRIBUTION,
         pickup:             DHL_PICKUP_ID,
-        rate:      { calculate: true, currency: order.currency || 'USD' },
+        rate:               { calculate: true, currency: order.currency || 'USD' },
+        // FIX: request estimated delivery date so DHL returns transit days
+        estimatedDeliveryDate: { calculate: true },
         packageDetail: {
           packageId:          ('RATE-' + (order.shipmentOrderCode||'').replace(/[^A-Za-z0-9]/g,'') + '-' + Date.now()).slice(0,30),
           packageDescription: order.shipmentOrderCode || 'Shipment',
@@ -231,8 +233,6 @@ app.post('/get-rate', async (req, res) => {
         });
         logResponse('GET-RATE', dhlRes.status, dhlRes.data);
         const prods = Array.isArray(dhlRes.data?.products) ? dhlRes.data.products : [];
-if (prods.length > 0) console.log('[GET-RATE] Product sample:', JSON.stringify(prods[0], null, 2));
-        // FIX: added deliveryDays from DHL deliveryCommitment.totalTransitDays
         rateList = prods.map((p) => ({
           carrier:        order.carrier || 'DHLEC',
           shippingOption: p.orderedProductId || p.productId || p.productName || 'GND',
@@ -240,7 +240,8 @@ if (prods.length > 0) console.log('[GET-RATE] Product sample:', JSON.stringify(p
           shippingCost:   parseFloat(p.rate?.amount || 0),
           otherCost:      0,
           currency:       p.rate?.currency || order.currency || 'USD',
-          estimatedDays:   parseInt(p.deliveryCommitment?.totalTransitDays, 10) || null,
+          // FIX: estimatedDays is the correct Logiwa field name
+          estimatedDays:  parseInt(p.deliveryCommitment?.totalTransitDays, 10) || null,
         }));
         console.log('[GET-RATE] OK ' + order.shipmentOrderCode + ' - ' + rateList.length + ' rates found');
         if (!rateList.length) msg = 'No DHL rates available for this route';
@@ -250,7 +251,6 @@ if (prods.length > 0) console.log('[GET-RATE] Product sample:', JSON.stringify(p
           ? 'DHL validation: ' + JSON.stringify(e.response.data.invalidParams)
           : 'DHL error: ' + (e.response?.data?.detail || e.response?.data?.title || e.message);
       }
-      // FIX: message must always be an array for Logiwa
       out.push({
         shipmentOrderCode:       order.shipmentOrderCode,
         shipmentOrderIdentifier: order.shipmentOrderIdentifier,
@@ -264,7 +264,6 @@ if (prods.length > 0) console.log('[GET-RATE] Product sample:', JSON.stringify(p
     return res.json(logiwaResponse);
   } catch (err) {
     console.error('[GET-RATE] Fatal:', err.message);
-    // FIX: wrap in { data: [...] } and use array for message
     return res.json({
       data: parseLogiwaBody(req.body).map((o) => ({
         shipmentOrderCode:       o.shipmentOrderCode,
@@ -410,7 +409,6 @@ app.post('/create-label', async (req, res) => {
         if (Array.isArray(errData?.invalidParams) && errData.invalidParams.length) {
           em = errData.invalidParams.map(p => p.name + ': ' + p.reason).join(' | ');
         }
-        // FIX: message must be an array for Logiwa
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
           shipmentOrderCode:       order.shipmentOrderCode,
@@ -436,7 +434,6 @@ app.post('/create-label', async (req, res) => {
   } catch (err) {
     console.error('[CREATE-LABEL] Fatal:', err.message);
     const o = parseLogiwaBody(req.body)[0] || {};
-    // FIX: message must be an array for Logiwa
     return res.json({
       data: [{
         shipmentOrderIdentifier: o.shipmentOrderIdentifier,
@@ -565,7 +562,7 @@ app.post('/end-of-day-report', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log('\n🚀 DHL eCommerce-Logiwa Middleware v2.3.0 on port ' + PORT);
+  console.log('\n🚀 DHL eCommerce-Logiwa Middleware v2.4.0 on port ' + PORT);
   console.log('   Label proxy  : ' + MIDDLEWARE_URL + '/label/:id');
   console.log('   Pickup ID    : ' + DHL_PICKUP_ID);
   console.log('   Distribution : ' + DHL_DISTRIBUTION);
