@@ -1,7 +1,9 @@
 /**
- * DHL eCommerce Americas <-> Logiwa Custom Carrier Middleware v2.4.1
- * Changes from v2.4.0:
- *   - Added debug logs to identify DHL transit day field location
+ * DHL eCommerce Americas <-> Logiwa Custom Carrier Middleware v2.4.3
+ * Changes from v2.4.2:
+ *   - create-label now does a rate lookup first to get actual postage cost
+ *   - rateDetail.totalCost and shippingCost now populated in Logiwa UI
+ *   - Falls back to 0 gracefully if rate lookup fails
  */
 const express = require('express');
 const axios = require('axios');
@@ -158,10 +160,60 @@ function buildReturnAddress(shipFrom) {
   };
 }
 
+// ─── RATE LOOKUP HELPER ───────────────────────────────────────────────────────
+// Called inside create-label to get the actual postage cost for the selected service
+async function getRateForService(token, order, weightLB, dims, targetService) {
+  const shipTo    = getAddr(order.shipTo);
+  const toContact = getContact(order.shipTo);
+  const l = parseFloat(dims.Length || dims.length || 0);
+  const w = parseFloat(dims.Width  || dims.width  || 0);
+  const h = parseFloat(dims.Height || dims.height || 0);
+
+  const rateReq = {
+    consigneeAddress: {
+      name:       toContact.name || toContact.company || 'Recipient',
+      address1:   shipTo.address1   || 'N/A',
+      address2:   shipTo.address2,
+      city:       shipTo.city       || 'N/A',
+      state:      shipTo.state,
+      postalCode: shipTo.postalCode,
+      country:    shipTo.country    || 'US',
+    },
+    returnAddress:      buildReturnAddress(order.shipFrom),
+    distributionCenter: DHL_DISTRIBUTION,
+    pickup:             DHL_PICKUP_ID,
+    rate:               { calculate: true, currency: order.currency || 'USD' },
+    estimatedDeliveryDate: { calculate: true },
+    packageDetail: {
+      packageId:          ('RATE-' + (order.shipmentOrderCode||'').replace(/[^A-Za-z0-9]/g,'') + '-' + Date.now()).slice(0,30),
+      packageDescription: order.shipmentOrderCode || 'Shipment',
+      weight: { unitOfMeasure: 'LB', value: weightLB },
+      ...(l > 0 && w > 0 && h > 0 && {
+        dimension: { length:l, width:w, height:h, unitOfMeasure:(dims.Units||dims.units||'IN').toUpperCase() },
+      }),
+    },
+  };
+
+  try {
+    const rateRes = await axios.post(DHL_BASE_URL + '/shipping/v4/products', rateReq, {
+      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+    });
+    const prods = Array.isArray(rateRes.data?.products) ? rateRes.data.products : [];
+    // Find the matching product for the selected service
+    const match = prods.find(p => (p.orderedProductId || '').toUpperCase() === targetService.toUpperCase());
+    const cost = parseFloat((match || prods[0])?.rate?.amount || 0);
+    console.log('[RATE-LOOKUP] Service=' + targetService + ' cost=$' + cost + ' from ' + prods.length + ' products');
+    return cost;
+  } catch (e) {
+    console.warn('[RATE-LOOKUP] Failed to get rate, defaulting to 0:', e.message);
+    return 0;
+  }
+}
+
 app.get('/', (req, res) => res.json({
   status: 'running',
   service: 'DHL eCommerce <-> Logiwa Middleware',
-  version: '2.4.1',
+  version: '2.4.3',
 }));
 
 app.get('/label/:id', (req, res) => {
@@ -230,11 +282,6 @@ app.post('/get-rate', async (req, res) => {
         });
         logResponse('GET-RATE', dhlRes.status, dhlRes.data);
         const prods = Array.isArray(dhlRes.data?.products) ? dhlRes.data.products : [];
-
-        // DEBUG: log full first product and top-level estimatedDeliveryDate to find transit day field
-        if (prods.length > 0) console.log('[GET-RATE] DEBUG product[0]:', JSON.stringify(prods[0], null, 2));
-        console.log('[GET-RATE] DEBUG estimatedDeliveryDate:', JSON.stringify(dhlRes.data?.estimatedDeliveryDate, null, 2));
-
         rateList = prods.map((p) => ({
           carrier:        order.carrier || 'DHLEC',
           shippingOption: p.orderedProductId || p.productId || p.productName || 'GND',
@@ -242,7 +289,7 @@ app.post('/get-rate', async (req, res) => {
           shippingCost:   parseFloat(p.rate?.amount || 0),
           otherCost:      0,
           currency:       p.rate?.currency || order.currency || 'USD',
-          estimatedDays:  parseInt(p.deliveryCommitment?.totalTransitDays, 10) || null,
+          estimatedDays:  parseInt(p.estimatedDeliveryDate?.deliveryDaysMin, 10) || null,
         }));
         console.log('[GET-RATE] OK ' + order.shipmentOrderCode + ' - ' + rateList.length + ' rates found');
         if (!rateList.length) msg = 'No DHL rates available for this route';
@@ -297,10 +344,17 @@ app.post('/create-label', async (req, res) => {
       const w = parseFloat(dims.Width  || dims.width  || 0);
       const h = parseFloat(dims.Height || dims.height || 0);
       const isInternational = (shipTo.country || 'US').toUpperCase() !== 'US';
+      const selectedService = mapServiceToDHL(order.shippingOption);
+
+      // FIX: Look up rate for selected service so Logiwa shows actual postage cost
+      const postageAmount = await getRateForService(token, order, weightLB, dims, selectedService);
+      const rateCurrency  = order.currency || 'USD';
+      console.log('[CREATE-LABEL] Postage cost for ' + selectedService + ': $' + postageAmount);
+
       const dhlReq = {
         pickup:             DHL_PICKUP_ID,
         distributionCenter: DHL_DISTRIBUTION,
-        orderedProductId:   mapServiceToDHL(order.shippingOption),
+        orderedProductId:   selectedService,
         returnAddress:      buildReturnAddress(order.shipFrom),
         packageDetail: {
           packageId,
@@ -372,7 +426,7 @@ app.post('/create-label', async (req, res) => {
         }
 
         const proxyLabelUrl = MIDDLEWARE_URL + '/label/' + trk;
-        console.log('[CREATE-LABEL] SUCCESS tracking=' + trk + ' labelUrl=' + proxyLabelUrl);
+        console.log('[CREATE-LABEL] SUCCESS tracking=' + trk + ' cost=$' + postageAmount + ' labelUrl=' + proxyLabelUrl);
 
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
@@ -386,18 +440,18 @@ app.post('/create-label', async (req, res) => {
             labelURL:              proxyLabelUrl,
             trackingUrl:           null,
             rateDetail: {
-              totalCost:    parseFloat(d.rateDetails?.totalAmount || 0),
-              shippingCost: parseFloat(d.rateDetails?.baseAmount  || 0),
-              otherCost:    parseFloat(d.rateDetails?.otherAmount  || 0),
-              currency:     order.currency || 'USD',
+              totalCost:    postageAmount,
+              shippingCost: postageAmount,
+              otherCost:    0,
+              currency:     rateCurrency,
             },
             externalReference: packageId,
           }],
           rateDetail: {
-            totalCost:    parseFloat(d.rateDetails?.totalAmount || 0),
-            shippingCost: parseFloat(d.rateDetails?.baseAmount  || 0),
-            otherCost:    parseFloat(d.rateDetails?.otherAmount  || 0),
-            currency:     order.currency || 'USD',
+            totalCost:    postageAmount,
+            shippingCost: postageAmount,
+            otherCost:    0,
+            currency:     rateCurrency,
           },
           masterTrackingNumber: trk,
           isSuccessful: true,
@@ -563,7 +617,7 @@ app.post('/end-of-day-report', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log('\n🚀 DHL eCommerce-Logiwa Middleware v2.4.1 on port ' + PORT);
+  console.log('\n🚀 DHL eCommerce-Logiwa Middleware v2.4.3 on port ' + PORT);
   console.log('   Label proxy  : ' + MIDDLEWARE_URL + '/label/:id');
   console.log('   Pickup ID    : ' + DHL_PICKUP_ID);
   console.log('   Distribution : ' + DHL_DISTRIBUTION);
