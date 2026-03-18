@@ -1,9 +1,8 @@
 /**
- * DHL eCommerce Americas <-> Logiwa Custom Carrier Middleware v2.4.3
- * Changes from v2.4.2:
- *   - create-label now does a rate lookup first to get actual postage cost
- *   - rateDetail.totalCost and shippingCost now populated in Logiwa UI
- *   - Falls back to 0 gracefully if rate lookup fails
+ * DHL eCommerce Americas <-> Logiwa Custom Carrier Middleware v2.4.4
+ * Changes from v2.4.3:
+ *   - /get-rate now adds customsDetails and shippingCost for international destinations
+ *   - Anything with a non-US country code is treated as international
  */
 const express = require('express');
 const axios = require('axios');
@@ -138,6 +137,18 @@ function stripUspsPrefix(trackingId) {
   return trackingId;
 }
 
+function buildCustomsDetails(customsItems, currency) {
+  if (!Array.isArray(customsItems) || !customsItems.length) return null;
+  return customsItems.map(item => ({
+    itemDescription:  item.description || 'Merchandise',
+    packagedQuantity: parseInt(item.quantity) || 1,
+    itemValue:        parseFloat(item.declaredValue) || 0,
+    currency:         currency || 'USD',
+    countryOfOrigin:  item.originCountryCode || 'US',
+    ...(item.hsTariffCode && { hsCode: item.hsTariffCode }),
+  }));
+}
+
 const DEFAULT_FROM = {
   name:'ShipFlow', address1:'625 JERSEY AVE STE 9', address2:'',
   city:'NEW BRUNSWICK', state:'NJ', postalCode:'08901', country:'US',
@@ -161,13 +172,14 @@ function buildReturnAddress(shipFrom) {
 }
 
 // ─── RATE LOOKUP HELPER ───────────────────────────────────────────────────────
-// Called inside create-label to get the actual postage cost for the selected service
+
 async function getRateForService(token, order, weightLB, dims, targetService) {
   const shipTo    = getAddr(order.shipTo);
   const toContact = getContact(order.shipTo);
   const l = parseFloat(dims.Length || dims.length || 0);
   const w = parseFloat(dims.Width  || dims.width  || 0);
   const h = parseFloat(dims.Height || dims.height || 0);
+  const isIntl = (shipTo.country || 'US').toUpperCase() !== 'US';
 
   const rateReq = {
     consigneeAddress: {
@@ -194,18 +206,26 @@ async function getRateForService(token, order, weightLB, dims, targetService) {
     },
   };
 
+  if (isIntl) {
+    rateReq.packageDetail.shippingCost = {
+      currency:      order.currency || 'USD',
+      declaredValue: parseFloat(order.shipmentOrderTotalPrice || 0),
+    };
+    const customs = buildCustomsDetails(order.internationalOptions?.customsItems, order.currency);
+    if (customs) rateReq.customsDetails = customs;
+  }
+
   try {
     const rateRes = await axios.post(DHL_BASE_URL + '/shipping/v4/products', rateReq, {
       headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
     });
     const prods = Array.isArray(rateRes.data?.products) ? rateRes.data.products : [];
-    // Find the matching product for the selected service
     const match = prods.find(p => (p.orderedProductId || '').toUpperCase() === targetService.toUpperCase());
     const cost = parseFloat((match || prods[0])?.rate?.amount || 0);
     console.log('[RATE-LOOKUP] Service=' + targetService + ' cost=$' + cost + ' from ' + prods.length + ' products');
     return cost;
   } catch (e) {
-    console.warn('[RATE-LOOKUP] Failed to get rate, defaulting to 0:', e.message);
+    console.warn('[RATE-LOOKUP] Failed, defaulting to 0:', e.message);
     return 0;
   }
 }
@@ -213,7 +233,7 @@ async function getRateForService(token, order, weightLB, dims, targetService) {
 app.get('/', (req, res) => res.json({
   status: 'running',
   service: 'DHL eCommerce <-> Logiwa Middleware',
-  version: '2.4.3',
+  version: '2.4.4',
 }));
 
 app.get('/label/:id', (req, res) => {
@@ -249,6 +269,8 @@ app.post('/get-rate', async (req, res) => {
       const l = parseFloat(dims.Length || dims.length || 0);
       const w = parseFloat(dims.Width  || dims.width  || 0);
       const h = parseFloat(dims.Height || dims.height || 0);
+      const isIntl = (shipTo.country || 'US').toUpperCase() !== 'US';
+
       const dhlReq = {
         consigneeAddress: {
           name:       toContact.name || toContact.company || 'Recipient',
@@ -273,6 +295,23 @@ app.post('/get-rate', async (req, res) => {
           }),
         },
       };
+
+      // FIX: international destinations require shippingCost + customsDetails for rate request
+      if (isIntl) {
+        console.log('[GET-RATE] International destination detected → country=' + shipTo.country);
+        dhlReq.packageDetail.shippingCost = {
+          currency:      order.currency || 'USD',
+          declaredValue: parseFloat(order.shipmentOrderTotalPrice || 0),
+        };
+        const customs = buildCustomsDetails(order.internationalOptions?.customsItems, order.currency);
+        if (customs) {
+          dhlReq.customsDetails = customs;
+          console.log('[GET-RATE] Added ' + customs.length + ' customs items');
+        } else {
+          console.warn('[GET-RATE] ⚠ International order but NO customs items found — rate may fail');
+        }
+      }
+
       const rateUrl = DHL_BASE_URL + '/shipping/v4/products';
       logRequest('GET-RATE', 'POST', rateUrl, { Authorization: 'Bearer ***', 'Content-Type': 'application/json' }, dhlReq);
       let rateList = [], msg = '';
@@ -346,7 +385,6 @@ app.post('/create-label', async (req, res) => {
       const isInternational = (shipTo.country || 'US').toUpperCase() !== 'US';
       const selectedService = mapServiceToDHL(order.shippingOption);
 
-      // FIX: Look up rate for selected service so Logiwa shows actual postage cost
       const postageAmount = await getRateForService(token, order, weightLB, dims, selectedService);
       const rateCurrency  = order.currency || 'USD';
       console.log('[CREATE-LABEL] Postage cost for ' + selectedService + ': $' + postageAmount);
@@ -377,22 +415,17 @@ app.post('/create-label', async (req, res) => {
           email:       toContact.email   || '',
         },
       };
-      const customs = order.internationalOptions?.customsItems;
+
       if (isInternational) {
         console.log('[CREATE-LABEL] International shipment → country=' + shipTo.country);
-        if (Array.isArray(customs) && customs.length > 0) {
-          dhlReq.customsDetails = customs.map((item) => ({
-            itemDescription:  item.description || 'Merchandise',
-            packagedQuantity: parseInt(item.quantity) || 1,
-            itemValue:        parseFloat(item.declaredValue) || 0,
-            currency:         order.currency || 'USD',
-            countryOfOrigin:  item.originCountryCode || 'US',
-            ...(item.hsTariffCode && { hsCode: item.hsTariffCode }),
-          }));
+        const customs = buildCustomsDetails(order.internationalOptions?.customsItems, order.currency);
+        if (customs) {
+          dhlReq.customsDetails = customs;
         } else {
           console.warn('[CREATE-LABEL] ⚠ International order but NO customs items found');
         }
       }
+
       const labelUrl = DHL_BASE_URL + '/shipping/v4/label?format=' + labelFmt.toUpperCase();
       logRequest('CREATE-LABEL', 'POST', labelUrl, { Authorization: 'Bearer ***', 'Content-Type': 'application/json' }, dhlReq);
       try {
@@ -617,7 +650,7 @@ app.post('/end-of-day-report', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log('\n🚀 DHL eCommerce-Logiwa Middleware v2.4.3 on port ' + PORT);
+  console.log('\n🚀 DHL eCommerce-Logiwa Middleware v2.4.4 on port ' + PORT);
   console.log('   Label proxy  : ' + MIDDLEWARE_URL + '/label/:id');
   console.log('   Pickup ID    : ' + DHL_PICKUP_ID);
   console.log('   Distribution : ' + DHL_DISTRIBUTION);
