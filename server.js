@@ -417,15 +417,21 @@ app.post('/create-label', async (req, res) => {
       };
 
       if (isInternational) {
-        console.log('[CREATE-LABEL] International shipment → country=' + shipTo.country);
-        const customs = buildCustomsDetails(order.internationalOptions?.customsItems, order.currency);
-        if (customs) {
-          dhlReq.customsDetails = customs;
-        } else {
-          console.warn('[CREATE-LABEL] ⚠ International order but NO customs items found');
-        }
-      }
+  console.log('[CREATE-LABEL] International shipment → country=' + shipTo.country);
+  
+  // ADD THIS — shippingCost required for international label creation
+  dhlReq.packageDetail.shippingCost = {
+    currency:      order.currency || 'USD',
+    declaredValue: parseFloat(order.shipmentOrderTotalPrice || 0),
+  };
 
+  const customs = buildCustomsDetails(order.internationalOptions?.customsItems, order.currency);
+  if (customs) {
+    dhlReq.customsDetails = customs;
+  } else {
+    console.warn('[CREATE-LABEL] ⚠ International order but NO customs items found');
+  }
+}
       const labelUrl = DHL_BASE_URL + '/shipping/v4/label?format=' + labelFmt.toUpperCase();
       logRequest('CREATE-LABEL', 'POST', labelUrl, { Authorization: 'Bearer ***', 'Content-Type': 'application/json' }, dhlReq);
       try {
