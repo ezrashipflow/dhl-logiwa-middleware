@@ -1,8 +1,10 @@
 /**
- * DHL eCommerce Americas <-> Logiwa Custom Carrier Middleware v2.4.4
- * Changes from v2.4.3:
- *   - /get-rate now adds customsDetails and shippingCost for international destinations
- *   - Anything with a non-US country code is treated as international
+ * DHL eCommerce Americas <-> Logiwa Custom Carrier Middleware v2.4.5
+ * Changes from v2.4.4:
+ *   - PLT-DDP service code supported: maps to PLT with dutiesPaid:true
+ *   - /get-rate: PLT-DDP returns only the PLT rate, labeled as PLT-DDP for Logiwa to match
+ *   - /create-label: PLT-DDP adds dutiesPaid:true to shippingCost
+ *   - getRateForService: PLT-DDP passes dutiesPaid:true for accurate cost lookup
  */
 const express = require('express');
 const axios = require('axios');
@@ -115,9 +117,11 @@ function weightToLB(value, unit) {
   return Math.max(Math.ceil(lb * 100) / 100, 0.01);
 }
 
+// CHANGE 1: mapServiceToDHL now recognises PLT-DDP → PLT
 function mapServiceToDHL(s) {
   if (!s) return 'GND';
   const u = s.toUpperCase();
+  if (u === 'PLT-DDP') return 'PLT'; // DDP variant — dutiesPaid handled separately
   const map = {
     'GND':'GND','GROUND':'GND','EXP':'EXP','EXPEDITED':'EXP',
     'MAX':'MAX','BGN':'BGN','BEX':'BEX','PLT':'PLT','PLY':'PLY',
@@ -172,6 +176,7 @@ function buildReturnAddress(shipFrom) {
 }
 
 // ─── RATE LOOKUP HELPER ───────────────────────────────────────────────────────
+// CHANGE 2: getRateForService now passes dutiesPaid:true when service is PLT-DDP
 
 async function getRateForService(token, order, weightLB, dims, targetService) {
   const shipTo    = getAddr(order.shipTo);
@@ -180,6 +185,7 @@ async function getRateForService(token, order, weightLB, dims, targetService) {
   const w = parseFloat(dims.Width  || dims.width  || 0);
   const h = parseFloat(dims.Height || dims.height || 0);
   const isIntl = (shipTo.country || 'US').toUpperCase() !== 'US';
+  const isDDP  = (order.shippingOption || '').toUpperCase() === 'PLT-DDP';
 
   const rateReq = {
     consigneeAddress: {
@@ -210,6 +216,7 @@ async function getRateForService(token, order, weightLB, dims, targetService) {
     rateReq.packageDetail.shippingCost = {
       currency:      order.currency || 'USD',
       declaredValue: parseFloat(order.shipmentOrderTotalPrice || 0),
+      ...(isDDP && { dutiesPaid: true }),
     };
     const customs = buildCustomsDetails(order.internationalOptions?.customsItems, order.currency);
     if (customs) rateReq.customsDetails = customs;
@@ -222,7 +229,7 @@ async function getRateForService(token, order, weightLB, dims, targetService) {
     const prods = Array.isArray(rateRes.data?.products) ? rateRes.data.products : [];
     const match = prods.find(p => (p.orderedProductId || '').toUpperCase() === targetService.toUpperCase());
     const cost = parseFloat((match || prods[0])?.rate?.amount || 0);
-    console.log('[RATE-LOOKUP] Service=' + targetService + ' cost=$' + cost + ' from ' + prods.length + ' products');
+    console.log('[RATE-LOOKUP] Service=' + targetService + (isDDP ? ' (DDP)' : '') + ' cost=$' + cost + ' from ' + prods.length + ' products');
     return cost;
   } catch (e) {
     console.warn('[RATE-LOOKUP] Failed, defaulting to 0:', e.message);
@@ -233,7 +240,7 @@ async function getRateForService(token, order, weightLB, dims, targetService) {
 app.get('/', (req, res) => res.json({
   status: 'running',
   service: 'DHL eCommerce <-> Logiwa Middleware',
-  version: '2.4.4',
+  version: '2.4.5',
 }));
 
 app.get('/label/:id', (req, res) => {
@@ -253,6 +260,9 @@ app.get('/label/:id', (req, res) => {
   res.send(buf);
 });
 
+// ─── GET RATE ─────────────────────────────────────────────────────────────────
+// CHANGE 3: PLT-DDP detected → send dutiesPaid:true, return rate labeled PLT-DDP
+
 app.post('/get-rate', async (req, res) => {
   console.log('\n[GET-RATE] ══ Incoming Logiwa request ══');
   console.log('[GET-RATE] Logiwa payload:\n', JSON.stringify(req.body, null, 2));
@@ -270,6 +280,7 @@ app.post('/get-rate', async (req, res) => {
       const w = parseFloat(dims.Width  || dims.width  || 0);
       const h = parseFloat(dims.Height || dims.height || 0);
       const isIntl = (shipTo.country || 'US').toUpperCase() !== 'US';
+      const isDDP  = (order.shippingOption || '').toUpperCase() === 'PLT-DDP';
 
       const dhlReq = {
         consigneeAddress: {
@@ -296,12 +307,12 @@ app.post('/get-rate', async (req, res) => {
         },
       };
 
-      // FIX: international destinations require shippingCost + customsDetails for rate request
       if (isIntl) {
-        console.log('[GET-RATE] International destination detected → country=' + shipTo.country);
+        console.log('[GET-RATE] International destination detected → country=' + shipTo.country + (isDDP ? ' DDP=true' : ''));
         dhlReq.packageDetail.shippingCost = {
           currency:      order.currency || 'USD',
           declaredValue: parseFloat(order.shipmentOrderTotalPrice || 0),
+          ...(isDDP && { dutiesPaid: true }),
         };
         const customs = buildCustomsDetails(order.internationalOptions?.customsItems, order.currency);
         if (customs) {
@@ -321,15 +332,37 @@ app.post('/get-rate', async (req, res) => {
         });
         logResponse('GET-RATE', dhlRes.status, dhlRes.data);
         const prods = Array.isArray(dhlRes.data?.products) ? dhlRes.data.products : [];
-        rateList = prods.map((p) => ({
-          carrier:        order.carrier || 'DHLEC',
-          shippingOption: p.orderedProductId || p.productId || p.productName || 'GND',
-          totalCost:      parseFloat(p.rate?.amount || 0),
-          shippingCost:   parseFloat(p.rate?.amount || 0),
-          otherCost:      0,
-          currency:       p.rate?.currency || order.currency || 'USD',
-          estimatedDays:  parseInt(p.estimatedDeliveryDate?.deliveryDaysMin, 10) || null,
-        }));
+
+        if (isDDP) {
+          // For PLT-DDP: find the PLT product, return it labeled as PLT-DDP
+          const pltProd = prods.find(p => (p.orderedProductId || '').toUpperCase() === 'PLT');
+          if (pltProd) {
+            rateList = [{
+              carrier:        order.carrier || 'DHLEC',
+              shippingOption: 'PLT-DDP',
+              totalCost:      parseFloat(pltProd.rate?.amount || 0),
+              shippingCost:   parseFloat(pltProd.rate?.amount || 0),
+              otherCost:      0,
+              currency:       pltProd.rate?.currency || order.currency || 'USD',
+              estimatedDays:  parseInt(pltProd.estimatedDeliveryDate?.deliveryDaysMin, 10) || null,
+            }];
+            console.log('[GET-RATE] PLT-DDP rate: $' + rateList[0].totalCost);
+          } else {
+            msg = 'PLT service not available for this route — DDP not supported';
+          }
+        } else {
+          // Non-DDP: return all available products as-is
+          rateList = prods.map((p) => ({
+            carrier:        order.carrier || 'DHLEC',
+            shippingOption: p.orderedProductId || p.productId || p.productName || 'GND',
+            totalCost:      parseFloat(p.rate?.amount || 0),
+            shippingCost:   parseFloat(p.rate?.amount || 0),
+            otherCost:      0,
+            currency:       p.rate?.currency || order.currency || 'USD',
+            estimatedDays:  parseInt(p.estimatedDeliveryDate?.deliveryDaysMin, 10) || null,
+          }));
+        }
+
         console.log('[GET-RATE] OK ' + order.shipmentOrderCode + ' - ' + rateList.length + ' rates found');
         if (!rateList.length) msg = 'No DHL rates available for this route';
       } catch (e) {
@@ -363,6 +396,9 @@ app.post('/get-rate', async (req, res) => {
   }
 });
 
+// ─── CREATE LABEL ─────────────────────────────────────────────────────────────
+// CHANGE 4: PLT-DDP adds dutiesPaid:true to shippingCost in label request
+
 app.post('/create-label', async (req, res) => {
   console.log('\n[CREATE-LABEL] ══ Incoming Logiwa request ══');
   console.log('[CREATE-LABEL] Logiwa payload:\n', JSON.stringify(req.body, null, 2));
@@ -383,11 +419,12 @@ app.post('/create-label', async (req, res) => {
       const w = parseFloat(dims.Width  || dims.width  || 0);
       const h = parseFloat(dims.Height || dims.height || 0);
       const isInternational = (shipTo.country || 'US').toUpperCase() !== 'US';
-      const selectedService = mapServiceToDHL(order.shippingOption);
+      const isDDP           = (order.shippingOption || '').toUpperCase() === 'PLT-DDP';
+      const selectedService = mapServiceToDHL(order.shippingOption); // PLT-DDP → PLT
 
       const postageAmount = await getRateForService(token, order, weightLB, dims, selectedService);
       const rateCurrency  = order.currency || 'USD';
-      console.log('[CREATE-LABEL] Postage cost for ' + selectedService + ': $' + postageAmount);
+      console.log('[CREATE-LABEL] Postage cost for ' + selectedService + (isDDP ? ' DDP' : '') + ': $' + postageAmount);
 
       const dhlReq = {
         pickup:             DHL_PICKUP_ID,
@@ -417,21 +454,20 @@ app.post('/create-label', async (req, res) => {
       };
 
       if (isInternational) {
-  console.log('[CREATE-LABEL] International shipment → country=' + shipTo.country);
-  
-  // ADD THIS — shippingCost required for international label creation
-  dhlReq.packageDetail.shippingCost = {
-    currency:      order.currency || 'USD',
-    declaredValue: parseFloat(order.shipmentOrderTotalPrice || 0),
-  };
+        console.log('[CREATE-LABEL] International shipment → country=' + shipTo.country + (isDDP ? ' DDP=true' : ''));
+        dhlReq.packageDetail.shippingCost = {
+          currency:      order.currency || 'USD',
+          declaredValue: parseFloat(order.shipmentOrderTotalPrice || 0),
+          ...(isDDP && { dutiesPaid: true }),
+        };
+        const customs = buildCustomsDetails(order.internationalOptions?.customsItems, order.currency);
+        if (customs) {
+          dhlReq.customsDetails = customs;
+        } else {
+          console.warn('[CREATE-LABEL] ⚠ International order but NO customs items found');
+        }
+      }
 
-  const customs = buildCustomsDetails(order.internationalOptions?.customsItems, order.currency);
-  if (customs) {
-    dhlReq.customsDetails = customs;
-  } else {
-    console.warn('[CREATE-LABEL] ⚠ International order but NO customs items found');
-  }
-}
       const labelUrl = DHL_BASE_URL + '/shipping/v4/label?format=' + labelFmt.toUpperCase();
       logRequest('CREATE-LABEL', 'POST', labelUrl, { Authorization: 'Bearer ***', 'Content-Type': 'application/json' }, dhlReq);
       try {
@@ -450,7 +486,7 @@ app.post('/create-label', async (req, res) => {
         const label = Array.isArray(d.labels) ? d.labels[0] : d;
 
         const trk = stripUspsPrefix(label.trackingId) || label.dhlPackageId || packageId;
-        console.log('[CREATE-LABEL] trackingId raw=' + label.trackingId + ' → USPS trk=' + trk);
+        console.log('[CREATE-LABEL] trackingId raw=' + label.trackingId + ' → trk=' + trk);
 
         if (label.labelData) {
           labelCache[trk] = {
@@ -656,7 +692,7 @@ app.post('/end-of-day-report', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log('\n🚀 DHL eCommerce-Logiwa Middleware v2.4.4 on port ' + PORT);
+  console.log('\n🚀 DHL eCommerce-Logiwa Middleware v2.4.5 on port ' + PORT);
   console.log('   Label proxy  : ' + MIDDLEWARE_URL + '/label/:id');
   console.log('   Pickup ID    : ' + DHL_PICKUP_ID);
   console.log('   Distribution : ' + DHL_DISTRIBUTION);
