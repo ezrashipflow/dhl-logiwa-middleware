@@ -140,7 +140,7 @@ function stripUspsPrefix(trackingId) {
 function buildCustomsDetails(customsItems, currency) {
   if (!Array.isArray(customsItems) || !customsItems.length) return null;
   return customsItems.map(item => ({
-    itemDescription:  item.description || 'Merchandise',
+    itemDescription: (item.description || 'Merchandise').slice(0, 50),
     packagedQuantity: parseInt(item.quantity) || 1,
     itemValue:        parseFloat(item.declaredValue) || 0,
     currency:         currency || 'USD',
