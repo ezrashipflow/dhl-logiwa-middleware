@@ -203,7 +203,7 @@ async function getRateForService(token, order, weightLB, dims, targetService) {
     rate:               { calculate: true, currency: order.currency || 'USD' },
     estimatedDeliveryDate: { calculate: true },
     packageDetail: {
-      packageId:          ('RATE-' + (order.shipmentOrderCode||'').replace(/[^A-Za-z0-9]/g,'') + '-' + Date.now()).slice(0,30),
+      packageId: ('RATE' + (order.shipmentOrderCode||'').replace(/[^A-Za-z0-9]/g,'') + Date.now()).slice(0,30),
       packageDescription: order.shipmentOrderCode || 'Shipment',
       weight: { unitOfMeasure: 'LB', value: weightLB },
       ...(l > 0 && w > 0 && h > 0 && {
@@ -412,7 +412,7 @@ app.post('/create-label', async (req, res) => {
       const shipTo    = getAddr(order.shipTo);
       const toContact = getContact(order.shipTo);
       const weightLB  = weightToLB(pkg.weight?.Value || pkg.weight?.value, pkg.weight?.Units || pkg.weight?.units);
-      const packageId = ((order.shipmentOrderCode||'').replace(/[^A-Za-z0-9]/g,'').slice(0,16) + '-' + Date.now()).slice(0,30);
+      const packageId = ((order.shipmentOrderCode||'').replace(/[^A-Za-z0-9]/g,'').slice(0,16) + Date.now()).slice(0,30);
       const labelFmt  = { PDF:'pdf', ZPL:'zpl', PNG:'png' }[(labelSpec.labelFileType||'').toUpperCase()] || 'pdf';
       const dims = pkg.dimensions || {};
       const l = parseFloat(dims.Length || dims.length || 0);
