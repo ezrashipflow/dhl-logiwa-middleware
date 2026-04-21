@@ -485,8 +485,10 @@ app.post('/create-label', async (req, res) => {
         const d     = dhlRes.data;
         const label = Array.isArray(d.labels) ? d.labels[0] : d;
 
-        const trk = stripUspsPrefix(label.trackingId) || label.dhlPackageId || packageId;
-        console.log('[CREATE-LABEL] trackingId raw=' + label.trackingId + ' → trk=' + trk);
+        const trk = isInternational
+          ? (label.packageId || label.dhlPackageId || packageId)
+          : (stripUspsPrefix(label.trackingId) || label.dhlPackageId || packageId);
+        console.log('[CREATE-LABEL] trackingId raw=' + label.trackingId + ' dhlPackageId=' + label.dhlPackageId + ' packageId=' + label.packageId + ' → trk=' + trk);
 
         if (label.labelData) {
           labelCache[trk] = {
