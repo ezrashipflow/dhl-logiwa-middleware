@@ -1,10 +1,9 @@
 /**
- * DHL eCommerce Americas <-> Logiwa Custom Carrier Middleware v2.4.5
- * Changes from v2.4.4:
- *   - PLT-DDP service code supported: maps to PLT with dutiesPaid:true
- *   - /get-rate: PLT-DDP returns only the PLT rate, labeled as PLT-DDP for Logiwa to match
- *   - /create-label: PLT-DDP adds dutiesPaid:true to shippingCost
- *   - getRateForService: PLT-DDP passes dutiesPaid:true for accurate cost lookup
+ * DHL eCommerce Americas <-> Logiwa Custom Carrier Middleware v2.4.6
+ * Changes from v2.4.5:
+ *   - Reduced logging verbosity to avoid Railway rate limit (no more full payload dumps)
+ *   - Label format now dynamic: reads from Logiwa labelSpecification (PDF or ZPL), defaults to PDF
+ *   - ZPL supported via labelFormat=ZPL query param on DHL label endpoint
  */
 const express = require('express');
 const axios = require('axios');
@@ -30,6 +29,9 @@ const labelCache = {};
 
 let cachedToken = null;
 let tokenExpiry  = 0;
+
+// ─── LOGGING ──────────────────────────────────────────────────────────────────
+// Carrier API calls only — no full Logiwa payload dumps (causes Railway log rate limit)
 
 function logRequest(tag, method, url, headers, body) {
   console.log('\n' + '─'.repeat(60));
@@ -59,6 +61,8 @@ function logError(tag, error) {
   console.error('─'.repeat(60) + '\n');
 }
 
+// ─── AUTH ─────────────────────────────────────────────────────────────────────
+
 async function getDHLToken() {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
   const params = new URLSearchParams();
@@ -79,6 +83,8 @@ async function getDHLToken() {
     return cachedToken;
   } catch (e) { logError('AUTH', e); throw e; }
 }
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 function parseLogiwaBody(body) { return Array.isArray(body) ? body : [body]; }
 
@@ -117,11 +123,10 @@ function weightToLB(value, unit) {
   return Math.max(Math.ceil(lb * 100) / 100, 0.01);
 }
 
-// CHANGE 1: mapServiceToDHL now recognises PLT-DDP → PLT
 function mapServiceToDHL(s) {
   if (!s) return 'GND';
   const u = s.toUpperCase();
-  if (u === 'PLT-DDP') return 'PLT'; // DDP variant — dutiesPaid handled separately
+  if (u === 'PLT-DDP') return 'PLT';
   const map = {
     'GND':'GND','GROUND':'GND','EXP':'EXP','EXPEDITED':'EXP',
     'MAX':'MAX','BGN':'BGN','BEX':'BEX','PLT':'PLT','PLY':'PLY',
@@ -144,13 +149,40 @@ function stripUspsPrefix(trackingId) {
 function buildCustomsDetails(customsItems, currency) {
   if (!Array.isArray(customsItems) || !customsItems.length) return null;
   return customsItems.map(item => ({
-    itemDescription: (item.description || 'Merchandise').slice(0, 50),
+    itemDescription:  (item.description || 'Merchandise').slice(0, 50),
     packagedQuantity: parseInt(item.quantity) || 1,
     itemValue:        parseFloat(item.declaredValue) || 0,
     currency:         currency || 'USD',
     countryOfOrigin:  item.originCountryCode || 'US',
     ...(item.hsTariffCode && { hsCode: item.hsTariffCode }),
   }));
+}
+
+/**
+ * Resolve label format from Logiwa labelSpecification.
+ * DHL label endpoint accepts format as a query param: ?format=PDF or ?format=ZPL
+ * labelData in response is always BASE64 regardless of format.
+ */
+function resolveLabelFormat(order) {
+  const raw = (
+    order.labelSpecification?.labelFileType ||
+    order.labelSpecification?.labelFormat   ||
+    'PDF'
+  ).toUpperCase();
+
+  if (raw === 'ZPL') {
+    return {
+      format:      'zpl',
+      queryParam:  'ZPL',
+      mimeType:    'application/x-zebra-zpl',
+    };
+  }
+  // Default PDF
+  return {
+    format:     'pdf',
+    queryParam: 'PDF',
+    mimeType:   'application/pdf',
+  };
 }
 
 const DEFAULT_FROM = {
@@ -176,7 +208,6 @@ function buildReturnAddress(shipFrom) {
 }
 
 // ─── RATE LOOKUP HELPER ───────────────────────────────────────────────────────
-// CHANGE 2: getRateForService now passes dutiesPaid:true when service is PLT-DDP
 
 async function getRateForService(token, order, weightLB, dims, targetService) {
   const shipTo    = getAddr(order.shipTo);
@@ -237,11 +268,15 @@ async function getRateForService(token, order, weightLB, dims, targetService) {
   }
 }
 
+// ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
+
 app.get('/', (req, res) => res.json({
   status: 'running',
   service: 'DHL eCommerce <-> Logiwa Middleware',
-  version: '2.4.5',
+  version: '2.4.6',
 }));
+
+// ─── LABEL PROXY ──────────────────────────────────────────────────────────────
 
 app.get('/label/:id', (req, res) => {
   const cached = labelCache[req.params.id];
@@ -261,15 +296,15 @@ app.get('/label/:id', (req, res) => {
 });
 
 // ─── GET RATE ─────────────────────────────────────────────────────────────────
-// CHANGE 3: PLT-DDP detected → send dutiesPaid:true, return rate labeled PLT-DDP
 
 app.post('/get-rate', async (req, res) => {
-  console.log('\n[GET-RATE] ══ Incoming Logiwa request ══');
-  console.log('[GET-RATE] Logiwa payload:\n', JSON.stringify(req.body, null, 2));
+  const orders = parseLogiwaBody(req.body);
+  console.log('\n[GET-RATE] ══ Incoming Logiwa request ══ orders=' + orders.length + ' first=' + orders[0]?.shipmentOrderCode + ' service=' + orders[0]?.shippingOption + ' to=' + (orders[0]?.shipTo?.address?.PostalCode || orders[0]?.shipTo?.address?.postalCode || '?'));
+
   try {
     const token  = await getDHLToken();
-    const orders = parseLogiwaBody(req.body);
     const out    = [];
+
     for (const order of orders) {
       const pkg       = order.requestedPackageLineItems?.[0] || {};
       const shipTo    = getAddr(order.shipTo);
@@ -308,7 +343,7 @@ app.post('/get-rate', async (req, res) => {
       };
 
       if (isIntl) {
-        console.log('[GET-RATE] International destination detected → country=' + shipTo.country + (isDDP ? ' DDP=true' : ''));
+        console.log('[GET-RATE] International destination → country=' + shipTo.country + (isDDP ? ' DDP=true' : ''));
         dhlReq.packageDetail.shippingCost = {
           currency:      order.currency || 'USD',
           declaredValue: parseFloat(order.shipmentOrderTotalPrice || 0),
@@ -325,6 +360,7 @@ app.post('/get-rate', async (req, res) => {
 
       const rateUrl = DHL_BASE_URL + '/shipping/v4/products';
       logRequest('GET-RATE', 'POST', rateUrl, { Authorization: 'Bearer ***', 'Content-Type': 'application/json' }, dhlReq);
+
       let rateList = [], msg = '';
       try {
         const dhlRes = await axios.post(rateUrl, dhlReq, {
@@ -334,7 +370,6 @@ app.post('/get-rate', async (req, res) => {
         const prods = Array.isArray(dhlRes.data?.products) ? dhlRes.data.products : [];
 
         if (isDDP) {
-          // For PLT-DDP: find the PLT product, return it labeled as PLT-DDP
           const pltProd = prods.find(p => (p.orderedProductId || '').toUpperCase() === 'PLT');
           if (pltProd) {
             rateList = [{
@@ -351,7 +386,6 @@ app.post('/get-rate', async (req, res) => {
             msg = 'PLT service not available for this route — DDP not supported';
           }
         } else {
-          // Non-DDP: return all available products as-is
           rateList = prods.map((p) => ({
             carrier:        order.carrier || 'DHLEC',
             shippingOption: p.orderedProductId || p.productId || p.productName || 'GND',
@@ -371,6 +405,7 @@ app.post('/get-rate', async (req, res) => {
           ? 'DHL validation: ' + JSON.stringify(e.response.data.invalidParams)
           : 'DHL error: ' + (e.response?.data?.detail || e.response?.data?.title || e.message);
       }
+
       out.push({
         shipmentOrderCode:       order.shipmentOrderCode,
         shipmentOrderIdentifier: order.shipmentOrderIdentifier,
@@ -379,9 +414,11 @@ app.post('/get-rate', async (req, res) => {
         message:      msg ? [msg] : [],
       });
     }
+
     const logiwaResponse = { data: [out[0]] };
-    console.log('[GET-RATE] → Response to Logiwa:\n', JSON.stringify(logiwaResponse, null, 2));
+    console.log('[GET-RATE] → Response to Logiwa: ' + (out[0]?.rateList?.length || 0) + ' rates for ' + out[0]?.shipmentOrderCode);
     return res.json(logiwaResponse);
+
   } catch (err) {
     console.error('[GET-RATE] Fatal:', err.message);
     return res.json({
@@ -397,30 +434,32 @@ app.post('/get-rate', async (req, res) => {
 });
 
 // ─── CREATE LABEL ─────────────────────────────────────────────────────────────
-// CHANGE 4: PLT-DDP adds dutiesPaid:true to shippingCost in label request
 
 app.post('/create-label', async (req, res) => {
-  console.log('\n[CREATE-LABEL] ══ Incoming Logiwa request ══');
-  console.log('[CREATE-LABEL] Logiwa payload:\n', JSON.stringify(req.body, null, 2));
+  const orders = parseLogiwaBody(req.body);
+  console.log('\n[CREATE-LABEL] ══ Incoming Logiwa request ══ orders=' + orders.length + ' first=' + orders[0]?.shipmentOrderCode + ' carrier=' + orders[0]?.carrier + ' service=' + orders[0]?.shippingOption);
+
   try {
     const token  = await getDHLToken();
-    const orders = parseLogiwaBody(req.body);
     const out    = [];
+
     for (const order of orders) {
       const pkg       = order.requestedPackageLineItems?.[0] || {};
-      const labelSpec = order.labelSpecification || {};
       const shipTo    = getAddr(order.shipTo);
       const toContact = getContact(order.shipTo);
       const weightLB  = weightToLB(pkg.weight?.Value || pkg.weight?.value, pkg.weight?.Units || pkg.weight?.units);
       const packageId = ((order.shipmentOrderCode||'').replace(/[^A-Za-z0-9]/g,'').slice(0,16) + Date.now()).slice(0,30);
-      const labelFmt  = { PDF:'pdf', ZPL:'zpl', PNG:'png' }[(labelSpec.labelFileType||'').toUpperCase()] || 'pdf';
       const dims = pkg.dimensions || {};
       const l = parseFloat(dims.Length || dims.length || 0);
       const w = parseFloat(dims.Width  || dims.width  || 0);
       const h = parseFloat(dims.Height || dims.height || 0);
       const isInternational = (shipTo.country || 'US').toUpperCase() !== 'US';
       const isDDP           = (order.shippingOption || '').toUpperCase() === 'PLT-DDP';
-      const selectedService = mapServiceToDHL(order.shippingOption); // PLT-DDP → PLT
+      const selectedService = mapServiceToDHL(order.shippingOption);
+
+      // Resolve label format from Logiwa labelSpecification — PDF or ZPL
+      const labelFmt = resolveLabelFormat(order);
+      console.log('[CREATE-LABEL] Label format resolved: ' + labelFmt.format.toUpperCase());
 
       const postageAmount = await getRateForService(token, order, weightLB, dims, selectedService);
       const rateCurrency  = order.currency || 'USD';
@@ -468,20 +507,25 @@ app.post('/create-label', async (req, res) => {
         }
       }
 
-      const labelUrl = DHL_BASE_URL + '/shipping/v4/label?format=' + labelFmt.toUpperCase();
+      // DHL label format is driven by query param: ?format=PDF or ?format=ZPL
+      const labelUrl = DHL_BASE_URL + '/shipping/v4/label?format=' + labelFmt.queryParam;
       logRequest('CREATE-LABEL', 'POST', labelUrl, { Authorization: 'Bearer ***', 'Content-Type': 'application/json' }, dhlReq);
+
       try {
         const dhlRes = await axios.post(labelUrl, dhlReq, {
           headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
         });
+
+        // Log response with label data size instead of full base64
         const logSafeData = JSON.parse(JSON.stringify(dhlRes.data));
         if (Array.isArray(logSafeData.labels)) {
-          logSafeData.labels = logSafeData.labels.map(l => ({
-            ...l,
-            labelData: l.labelData ? '[BASE64 ' + Buffer.from(l.labelData,'base64').length + ' bytes]' : undefined,
+          logSafeData.labels = logSafeData.labels.map(lbl => ({
+            ...lbl,
+            labelData: lbl.labelData ? '[BASE64 ' + Buffer.from(lbl.labelData, 'base64').length + ' bytes]' : undefined,
           }));
         }
         logResponse('CREATE-LABEL', dhlRes.status, logSafeData);
+
         const d     = dhlRes.data;
         const label = Array.isArray(d.labels) ? d.labels[0] : d;
 
@@ -494,16 +538,17 @@ app.post('/create-label', async (req, res) => {
           labelCache[trk] = {
             labelData:         label.labelData,
             encodeType:        label.encodeType || 'BASE64',
-            format:            labelFmt,
+            format:            labelFmt.format,
+            mimeType:          labelFmt.mimeType,
             originalPackageId: packageId,
           };
-          console.log('[CREATE-LABEL] Label cached → key=' + trk + ' format=' + labelFmt);
+          console.log('[CREATE-LABEL] Label cached → key=' + trk + ' format=' + labelFmt.format);
         } else {
           console.warn('[CREATE-LABEL] ⚠ DHL response contained no labelData field');
         }
 
         const proxyLabelUrl = MIDDLEWARE_URL + '/label/' + trk;
-        console.log('[CREATE-LABEL] SUCCESS tracking=' + trk + ' cost=$' + postageAmount + ' labelUrl=' + proxyLabelUrl);
+        console.log('[CREATE-LABEL] SUCCESS tracking=' + trk + ' cost=$' + postageAmount + ' format=' + labelFmt.format + ' labelUrl=' + proxyLabelUrl);
 
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
@@ -534,6 +579,7 @@ app.post('/create-label', async (req, res) => {
           isSuccessful: true,
           message:      [],
         });
+
       } catch (e) {
         logError('CREATE-LABEL', e);
         const errData = e.response?.data;
@@ -554,15 +600,11 @@ app.post('/create-label', async (req, res) => {
         });
       }
     }
+
     const logiwaResponse = { data: [out[0]] };
-    console.log('[CREATE-LABEL] → Response to Logiwa:\n', JSON.stringify({
-      ...logiwaResponse,
-      data: logiwaResponse.data?.map(d => ({
-        ...d,
-        packageResponse: d.packageResponse?.map(p => ({ ...p, encodedLabel: p.encodedLabel ? '[omitted]' : '' })),
-      })),
-    }, null, 2));
+    console.log('[CREATE-LABEL] → Response to Logiwa: tracking=' + out[0]?.masterTrackingNumber + ' success=' + out[0]?.isSuccessful);
     return res.json(logiwaResponse);
+
   } catch (err) {
     console.error('[CREATE-LABEL] Fatal:', err.message);
     const o = parseLogiwaBody(req.body)[0] || {};
@@ -582,12 +624,13 @@ app.post('/create-label', async (req, res) => {
   }
 });
 
+// ─── VOID LABEL ───────────────────────────────────────────────────────────────
+
 app.post('/void-label', async (req, res) => {
-  console.log('\n[VOID-LABEL] ══ Incoming Logiwa request ══');
-  console.log('[VOID-LABEL] Payload:\n', JSON.stringify(req.body, null, 2));
+  const orders = parseLogiwaBody(req.body);
+  console.log('\n[VOID-LABEL] ══ Incoming Logiwa request ══ trk=' + orders[0]?.masterTrackingNumber);
   try {
     const token  = await getDHLToken();
-    const orders = parseLogiwaBody(req.body);
     const out    = [];
     for (const order of orders) {
       const trk = order.masterTrackingNumber;
@@ -630,12 +673,13 @@ app.post('/void-label', async (req, res) => {
   }
 });
 
+// ─── END OF DAY REPORT ────────────────────────────────────────────────────────
+
 app.post('/end-of-day-report', async (req, res) => {
-  console.log('\n[EOD] ══ Incoming Logiwa request ══');
-  console.log('[EOD] Payload:\n', JSON.stringify(req.body, null, 2));
+  const body = Array.isArray(req.body) ? req.body[0] : req.body;
+  console.log('\n[EOD] ══ Incoming Logiwa request ══ carrier=' + body?.carrier);
   try {
     const token = await getDHLToken();
-    const body  = Array.isArray(req.body) ? req.body[0] : req.body;
 
     const manifestReq = { pickup: DHL_PICKUP_ID, manifests: [] };
     const createUrl = DHL_BASE_URL + '/shipping/v4/manifest';
@@ -670,22 +714,19 @@ app.post('/end-of-day-report', async (req, res) => {
       console.warn('[EOD] ⚠ Manifest still processing after 10 attempts — returning partial data');
     }
 
-    const encodedReport = Buffer.from(JSON.stringify(manifestData)).toString('base64');
-
     return res.json({
       carrierSetupIdentifier: body.carrierSetupIdentifier,
       carrier:        body.carrier || 'DHLEC',
-      encodedReport,
+      encodedReport:  Buffer.from(JSON.stringify(manifestData)).toString('base64'),
       isSuccessful:   true,
       message:        '',
     });
 
   } catch (err) {
     logError('EOD', err);
-    const b = Array.isArray(req.body) ? req.body[0] : req.body;
     return res.json({
-      carrierSetupIdentifier: b.carrierSetupIdentifier,
-      carrier: b.carrier || 'DHLEC',
+      carrierSetupIdentifier: body.carrierSetupIdentifier,
+      carrier: body.carrier || 'DHLEC',
       encodedReport: '',
       isSuccessful: false,
       message: 'Error: ' + err.message,
@@ -694,7 +735,7 @@ app.post('/end-of-day-report', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log('\n🚀 DHL eCommerce-Logiwa Middleware v2.4.5 on port ' + PORT);
+  console.log('\n🚀 DHL eCommerce-Logiwa Middleware v2.4.6 on port ' + PORT);
   console.log('   Label proxy  : ' + MIDDLEWARE_URL + '/label/:id');
   console.log('   Pickup ID    : ' + DHL_PICKUP_ID);
   console.log('   Distribution : ' + DHL_DISTRIBUTION);
