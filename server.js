@@ -1,9 +1,14 @@
 /**
- * DHL eCommerce Americas <-> Logiwa Custom Carrier Middleware v2.4.6
- * Changes from v2.4.5:
- *   - Reduced logging verbosity to avoid Railway rate limit (no more full payload dumps)
- *   - Label format now dynamic: reads from Logiwa labelSpecification (PDF or ZPL), defaults to PDF
- *   - ZPL supported via labelFormat=ZPL query param on DHL label endpoint
+ * DHL eCommerce Americas <-> Logiwa Custom Carrier Middleware v2.5.0
+ * Changes from v2.4.6:
+ *   - MULTI-BOX support: /get-rate and /create-label now loop over every
+ *     requestedPackageLineItems entry instead of only [0]. Rates are summed
+ *     across boxes; create-label returns one tracking number per box.
+ *   - Per-box customs: international customsDetails + declaredValue are built
+ *     from each box's products[] (what was actually packed in that box),
+ *     falling back to order-level internationalOptions.customsItems only when
+ *     a box has no products[]. Stops over-declaring the whole order on each box.
+ *   - Single-line request/response logging to stay under Railway's 500 logs/sec.
  */
 const express = require('express');
 const axios = require('axios');
@@ -33,32 +38,31 @@ let tokenExpiry  = 0;
 // ─── LOGGING ──────────────────────────────────────────────────────────────────
 // Carrier API calls only — no full Logiwa payload dumps (causes Railway log rate limit)
 
+// Single-line logs only. Railway drops messages past 500 logs/sec, and the old
+// pretty-printed dumps emitted one log line per JSON line — enough to blow the
+// cap on a multi-box order. Keep each request/response to a single line.
 function logRequest(tag, method, url, headers, body) {
-  console.log('\n' + '─'.repeat(60));
-  console.log('[' + tag + '] ► REQUEST  ' + method + ' ' + url);
-  console.log('[' + tag + ']   HEADERS: ' + JSON.stringify(headers, null, 2));
-  if (body) console.log('[' + tag + ']   BODY:\n' + JSON.stringify(body, null, 2));
+  let line = '[' + tag + '] ► REQUEST ' + method + ' ' + url;
+  if (body) {
+    const s = JSON.stringify(body);
+    line += ' BODY: ' + (s.length > 1500 ? s.slice(0, 1500) + '…[truncated]' : s);
+  }
+  console.log(line);
 }
 
 function logResponse(tag, status, data) {
-  console.log('[' + tag + '] ◄ RESPONSE status=' + status);
-  const body = JSON.stringify(data, null, 2);
-  console.log('[' + tag + ']   BODY:\n' + body.slice(0, 1000) + (body.length > 1000 ? '\n...[truncated]' : ''));
-  console.log('─'.repeat(60) + '\n');
+  const s = JSON.stringify(data);
+  console.log('[' + tag + '] ◄ RESPONSE status=' + status + ' BODY: ' + (s.length > 1000 ? s.slice(0, 1000) + '…[truncated]' : s));
 }
 
 function logError(tag, error) {
-  console.error('[' + tag + '] ✗ ERROR');
   if (error.response) {
-    console.error('[' + tag + ']   HTTP STATUS : ' + error.response.status);
-    console.error('[' + tag + ']   RESPONSE HEADERS: ' + JSON.stringify(error.response.headers, null, 2));
-    console.error('[' + tag + ']   RESPONSE BODY:\n' + JSON.stringify(error.response.data, null, 2));
+    console.error('[' + tag + '] ✗ ERROR status=' + error.response.status + ' BODY: ' + JSON.stringify(error.response.data));
   } else if (error.request) {
-    console.error('[' + tag + ']   NO RESPONSE RECEIVED (network error)');
+    console.error('[' + tag + '] ✗ ERROR NO RESPONSE RECEIVED (network error): ' + error.message);
   } else {
-    console.error('[' + tag + ']   MESSAGE: ' + error.message);
+    console.error('[' + tag + '] ✗ ERROR ' + error.message);
   }
-  console.error('─'.repeat(60) + '\n');
 }
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
@@ -148,14 +152,68 @@ function stripUspsPrefix(trackingId) {
 
 function buildCustomsDetails(customsItems, currency) {
   if (!Array.isArray(customsItems) || !customsItems.length) return null;
-  return customsItems.map(item => ({
-    itemDescription:  (item.description || 'Merchandise').slice(0, 50),
-    packagedQuantity: parseInt(item.quantity) || 1,
-    itemValue:        parseFloat(item.declaredValue) || 0,
-    currency:         currency || 'USD',
-    countryOfOrigin:  item.originCountryCode || 'US',
-    ...(item.hsTariffCode && { hsCode: item.hsTariffCode }),
-  }));
+  return customsItems.map(item => {
+    // DHL itemValue is PER-UNIT and DHL multiplies it by packagedQuantity.
+    // Logiwa's declaredValue is the LINE TOTAL, so divide by quantity — else
+    // DHL inflates the customs value by qty and trips its $2,500 cap.
+    const qty       = parseInt(item.quantity) || 1;
+    const lineTotal = parseFloat(item.declaredValue) || 0;
+    return {
+      itemDescription:  (item.description || 'Merchandise').slice(0, 50),
+      packagedQuantity: qty,
+      itemValue:        Math.round((lineTotal / qty) * 100) / 100,
+      currency:         currency || 'USD',
+      countryOfOrigin:  item.originCountryCode || 'US',
+      ...(item.hsTariffCode && { hsCode: item.hsTariffCode }),
+    };
+  });
+}
+
+// requestedPackageLineItems[].products[] = the items actually packed in THAT
+// box. internationalOptions.customsItems[] is the order-level rollup of all
+// boxes' products. For multi-box international shipments we must declare each
+// box's own products — not the whole order on every box.
+function buildCustomsFromProducts(products, currency) {
+  if (!Array.isArray(products) || !products.length) return null;
+  return products.map(item => {
+    // itemValue is PER-UNIT (DHL multiplies by packagedQuantity); Logiwa sends
+    // declaredValue as the line total, so divide by quantity. See note above.
+    const qty       = parseInt(item.quantity) || 1;
+    const lineTotal = parseFloat(item.declaredValue) || 0;
+    return {
+      itemDescription:  (item.description || 'Merchandise').slice(0, 50),
+      packagedQuantity: qty,
+      itemValue:        Math.round((lineTotal / qty) * 100) / 100,
+      currency:         currency || 'USD',
+      countryOfOrigin:  item.originCountryCode || 'US',
+      ...(item.hsTariffCode && { hsCode: item.hsTariffCode }),
+    };
+  });
+}
+
+function sumDeclaredValue(products) {
+  if (!Array.isArray(products)) return 0;
+  return Math.round(products.reduce((s, p) => s + (parseFloat(p.declaredValue) || 0), 0) * 100) / 100;
+}
+
+// Always returns an array of at least one box, so callers can loop uniformly.
+function getBoxes(order) {
+  const items = order.requestedPackageLineItems;
+  return (Array.isArray(items) && items.length) ? items : [{}];
+}
+
+// Per-box customs + declaredValue for an international shipment. Prefers the
+// box's own products[]; falls back to order-level customsItems / order total
+// only when a box has no products[].
+function boxCustomsAndValue(order, box) {
+  const hasProducts = box && Array.isArray(box.products) && box.products.length;
+  const customs = hasProducts
+    ? buildCustomsFromProducts(box.products, order.currency)
+    : buildCustomsDetails(order.internationalOptions?.customsItems, order.currency);
+  const declaredValue = hasProducts
+    ? sumDeclaredValue(box.products)
+    : parseFloat(order.shipmentOrderTotalPrice || 0);
+  return { customs, declaredValue };
 }
 
 /**
@@ -209,7 +267,7 @@ function buildReturnAddress(shipFrom) {
 
 // ─── RATE LOOKUP HELPER ───────────────────────────────────────────────────────
 
-async function getRateForService(token, order, weightLB, dims, targetService) {
+async function getRateForService(token, order, weightLB, dims, targetService, box) {
   const shipTo    = getAddr(order.shipTo);
   const toContact = getContact(order.shipTo);
   const l = parseFloat(dims.Length || dims.length || 0);
@@ -244,12 +302,12 @@ async function getRateForService(token, order, weightLB, dims, targetService) {
   };
 
   if (isIntl) {
+    const { customs, declaredValue } = boxCustomsAndValue(order, box);
     rateReq.packageDetail.shippingCost = {
       currency:      order.currency || 'USD',
-      declaredValue: parseFloat(order.shipmentOrderTotalPrice || 0),
+      declaredValue,
       ...(isDDP && { dutiesPaid: true }),
     };
-    const customs = buildCustomsDetails(order.internationalOptions?.customsItems, order.currency);
     if (customs) rateReq.customsDetails = customs;
   }
 
@@ -273,7 +331,7 @@ async function getRateForService(token, order, weightLB, dims, targetService) {
 app.get('/', (req, res) => res.json({
   status: 'running',
   service: 'DHL eCommerce <-> Logiwa Middleware',
-  version: '2.4.6',
+  version: '2.5.0',
 }));
 
 // ─── LABEL PROXY ──────────────────────────────────────────────────────────────
@@ -306,99 +364,121 @@ app.post('/get-rate', async (req, res) => {
     const out    = [];
 
     for (const order of orders) {
-      const pkg       = order.requestedPackageLineItems?.[0] || {};
       const shipTo    = getAddr(order.shipTo);
       const toContact = getContact(order.shipTo);
-      const weightLB  = weightToLB(pkg.weight?.Value || pkg.weight?.value, pkg.weight?.Units || pkg.weight?.units);
-      const dims = pkg.dimensions || {};
-      const l = parseFloat(dims.Length || dims.length || 0);
-      const w = parseFloat(dims.Width  || dims.width  || 0);
-      const h = parseFloat(dims.Height || dims.height || 0);
-      const isIntl = (shipTo.country || 'US').toUpperCase() !== 'US';
-      const isDDP  = (order.shippingOption || '').toUpperCase() === 'PLT-DDP';
+      const isIntl   = (shipTo.country || 'US').toUpperCase() !== 'US';
+      const isDDP    = (order.shippingOption || '').toUpperCase() === 'PLT-DDP';
+      const currency = order.currency || 'USD';
+      const boxes    = getBoxes(order);
+      const round2   = (n) => Math.round(n * 100) / 100;
 
-      const dhlReq = {
-        consigneeAddress: {
-          name:       toContact.name || toContact.company || 'Recipient',
-          address1:   shipTo.address1   || 'N/A',
-          address2:   shipTo.address2,
-          city:       shipTo.city       || 'N/A',
-          state:      shipTo.state,
-          postalCode: shipTo.postalCode,
-          country:    shipTo.country    || 'US',
-        },
-        returnAddress:      buildReturnAddress(order.shipFrom),
-        distributionCenter: DHL_DISTRIBUTION,
-        pickup:             DHL_PICKUP_ID,
-        rate:               { calculate: true, currency: order.currency || 'USD' },
-        estimatedDeliveryDate: { calculate: true },
-        packageDetail: {
-          packageId:          ('RATE-' + (order.shipmentOrderCode||'').replace(/[^A-Za-z0-9]/g,'') + '-' + Date.now()).slice(0,30),
-          packageDescription: order.shipmentOrderCode || 'Shipment',
-          weight: { unitOfMeasure: 'LB', value: weightLB },
-          ...(l > 0 && w > 0 && h > 0 && {
-            dimension: { length:l, width:w, height:h, unitOfMeasure:(dims.Units||dims.units||'IN').toUpperCase() },
-          }),
-        },
-      };
-
-      if (isIntl) {
-        console.log('[GET-RATE] International destination → country=' + shipTo.country + (isDDP ? ' DDP=true' : ''));
-        dhlReq.packageDetail.shippingCost = {
-          currency:      order.currency || 'USD',
-          declaredValue: parseFloat(order.shipmentOrderTotalPrice || 0),
-          ...(isDDP && { dutiesPaid: true }),
-        };
-        const customs = buildCustomsDetails(order.internationalOptions?.customsItems, order.currency);
-        if (customs) {
-          dhlReq.customsDetails = customs;
-          console.log('[GET-RATE] Added ' + customs.length + ' customs items');
-        } else {
-          console.warn('[GET-RATE] ⚠ International order but NO customs items found — rate may fail');
-        }
-      }
-
-      const rateUrl = DHL_BASE_URL + '/shipping/v4/products';
-      logRequest('GET-RATE', 'POST', rateUrl, { Authorization: 'Bearer ***', 'Content-Type': 'application/json' }, dhlReq);
+      console.log('[GET-RATE] ' + order.shipmentOrderCode + ' boxes=' + boxes.length + (isIntl ? ' INTL ' + shipTo.country : ' DOM') + (isDDP ? ' DDP' : ''));
 
       let rateList = [], msg = '';
       try {
-        const dhlRes = await axios.post(rateUrl, dhlReq, {
-          headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+        // Price every box; collect each box's returned product list.
+        const perBoxProducts = [];
+        for (const box of boxes) {
+          const weightLB = weightToLB(box.weight?.Value || box.weight?.value, box.weight?.Units || box.weight?.units);
+          const dims = box.dimensions || {};
+          const l = parseFloat(dims.Length || dims.length || 0);
+          const w = parseFloat(dims.Width  || dims.width  || 0);
+          const h = parseFloat(dims.Height || dims.height || 0);
+
+          const dhlReq = {
+            consigneeAddress: {
+              name:       toContact.name || toContact.company || 'Recipient',
+              address1:   shipTo.address1   || 'N/A',
+              address2:   shipTo.address2,
+              city:       shipTo.city       || 'N/A',
+              state:      shipTo.state,
+              postalCode: shipTo.postalCode,
+              country:    shipTo.country    || 'US',
+            },
+            returnAddress:      buildReturnAddress(order.shipFrom),
+            distributionCenter: DHL_DISTRIBUTION,
+            pickup:             DHL_PICKUP_ID,
+            rate:               { calculate: true, currency },
+            estimatedDeliveryDate: { calculate: true },
+            packageDetail: {
+              packageId:          ('RATE-' + (order.shipmentOrderCode||'').replace(/[^A-Za-z0-9]/g,'') + '-' + (box.packageSequenceNumber ?? 0) + '-' + Date.now()).slice(0,30),
+              packageDescription: order.shipmentOrderCode || 'Shipment',
+              weight: { unitOfMeasure: 'LB', value: weightLB },
+              ...(l > 0 && w > 0 && h > 0 && {
+                dimension: { length:l, width:w, height:h, unitOfMeasure:(dims.Units||dims.units||'IN').toUpperCase() },
+              }),
+            },
+          };
+
+          if (isIntl) {
+            const { customs, declaredValue } = boxCustomsAndValue(order, box);
+            dhlReq.packageDetail.shippingCost = {
+              currency,
+              declaredValue,
+              ...(isDDP && { dutiesPaid: true }),
+            };
+            if (customs) dhlReq.customsDetails = customs;
+            else console.warn('[GET-RATE] ⚠ International order but NO customs/products for box ' + (box.packageSequenceNumber ?? 0));
+          }
+
+          const rateUrl = DHL_BASE_URL + '/shipping/v4/products';
+          logRequest('GET-RATE', 'POST', rateUrl, {}, dhlReq);
+          const dhlRes = await axios.post(rateUrl, dhlReq, {
+            headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          });
+          logResponse('GET-RATE', dhlRes.status, dhlRes.data);
+          perBoxProducts.push(Array.isArray(dhlRes.data?.products) ? dhlRes.data.products : []);
+        }
+
+        // Combine boxes into order-level options. A service is only offered if
+        // it priced for EVERY box; the order cost is the sum across boxes.
+        const nBoxes = perBoxProducts.length;
+        const svc = {}; // serviceId -> { cost, currency, estDays, count }
+        perBoxProducts.forEach((prods) => {
+          prods.forEach((p) => {
+            const id   = p.orderedProductId || p.productId || p.productName || 'GND';
+            const amt  = parseFloat(p.rate?.amount || 0);
+            const cur  = p.rate?.currency || currency;
+            const days = parseInt(p.estimatedDeliveryDate?.deliveryDaysMin, 10);
+            if (!svc[id]) svc[id] = { cost: 0, currency: cur, estDays: null, count: 0 };
+            svc[id].cost  += amt;
+            svc[id].count += 1;
+            if (days) svc[id].estDays = Math.max(svc[id].estDays || 0, days);
+          });
         });
-        logResponse('GET-RATE', dhlRes.status, dhlRes.data);
-        const prods = Array.isArray(dhlRes.data?.products) ? dhlRes.data.products : [];
 
         if (isDDP) {
-          const pltProd = prods.find(p => (p.orderedProductId || '').toUpperCase() === 'PLT');
-          if (pltProd) {
+          const plt = svc['PLT'];
+          if (plt && plt.count === nBoxes) {
             rateList = [{
               carrier:        order.carrier || 'DHLEC',
               shippingOption: 'PLT-DDP',
-              totalCost:      parseFloat(pltProd.rate?.amount || 0),
-              shippingCost:   parseFloat(pltProd.rate?.amount || 0),
+              totalCost:      round2(plt.cost),
+              shippingCost:   round2(plt.cost),
               otherCost:      0,
-              currency:       pltProd.rate?.currency || order.currency || 'USD',
-              estimatedDays:  parseInt(pltProd.estimatedDeliveryDate?.deliveryDaysMin, 10) || null,
+              currency:       plt.currency,
+              estimatedDays:  plt.estDays,
             }];
-            console.log('[GET-RATE] PLT-DDP rate: $' + rateList[0].totalCost);
+            console.log('[GET-RATE] PLT-DDP rate (' + nBoxes + ' boxes): $' + round2(plt.cost));
           } else {
-            msg = 'PLT service not available for this route — DDP not supported';
+            msg = 'PLT service not available for all boxes — DDP not supported for this shipment';
           }
         } else {
-          rateList = prods.map((p) => ({
-            carrier:        order.carrier || 'DHLEC',
-            shippingOption: p.orderedProductId || p.productId || p.productName || 'GND',
-            totalCost:      parseFloat(p.rate?.amount || 0),
-            shippingCost:   parseFloat(p.rate?.amount || 0),
-            otherCost:      0,
-            currency:       p.rate?.currency || order.currency || 'USD',
-            estimatedDays:  parseInt(p.estimatedDeliveryDate?.deliveryDaysMin, 10) || null,
-          }));
+          rateList = Object.entries(svc)
+            .filter(([, v]) => v.count === nBoxes)
+            .map(([id, v]) => ({
+              carrier:        order.carrier || 'DHLEC',
+              shippingOption: id,
+              totalCost:      round2(v.cost),
+              shippingCost:   round2(v.cost),
+              otherCost:      0,
+              currency:       v.currency,
+              estimatedDays:  v.estDays,
+            }));
         }
 
-        console.log('[GET-RATE] OK ' + order.shipmentOrderCode + ' - ' + rateList.length + ' rates found');
-        if (!rateList.length) msg = 'No DHL rates available for this route';
+        console.log('[GET-RATE] OK ' + order.shipmentOrderCode + ' — ' + rateList.length + ' rates (' + nBoxes + ' boxes)');
+        if (!rateList.length && !msg) msg = 'No DHL rates available for this route';
       } catch (e) {
         logError('GET-RATE', e);
         msg = e.response?.data?.invalidParams
@@ -444,161 +524,162 @@ app.post('/create-label', async (req, res) => {
     const out    = [];
 
     for (const order of orders) {
-      const pkg       = order.requestedPackageLineItems?.[0] || {};
       const shipTo    = getAddr(order.shipTo);
       const toContact = getContact(order.shipTo);
-      const weightLB  = weightToLB(pkg.weight?.Value || pkg.weight?.value, pkg.weight?.Units || pkg.weight?.units);
-      const packageId = ((order.shipmentOrderCode||'').replace(/[^A-Za-z0-9]/g,'').slice(0,16) + Date.now()).slice(0,30);
-      const dims = pkg.dimensions || {};
-      const l = parseFloat(dims.Length || dims.length || 0);
-      const w = parseFloat(dims.Width  || dims.width  || 0);
-      const h = parseFloat(dims.Height || dims.height || 0);
       const isInternational = (shipTo.country || 'US').toUpperCase() !== 'US';
       const isDDP           = (order.shippingOption || '').toUpperCase() === 'PLT-DDP';
       const selectedService = mapServiceToDHL(order.shippingOption);
+      const labelFmt        = resolveLabelFormat(order);
+      const rateCurrency    = order.currency || 'USD';
+      const boxes           = getBoxes(order);
+      const round2          = (n) => Math.round(n * 100) / 100;
 
-      // Resolve label format from Logiwa labelSpecification — PDF or ZPL
-      const labelFmt = resolveLabelFormat(order);
-      console.log('[CREATE-LABEL] Label format resolved: ' + labelFmt.format.toUpperCase());
+      console.log('[CREATE-LABEL] ' + order.shipmentOrderCode + ' boxes=' + boxes.length + ' service=' + selectedService + (isInternational ? ' INTL ' + shipTo.country : ' DOM') + (isDDP ? ' DDP' : '') + ' format=' + labelFmt.format.toUpperCase());
 
-      const postageAmount = await getRateForService(token, order, weightLB, dims, selectedService);
-      const rateCurrency  = order.currency || 'USD';
-      console.log('[CREATE-LABEL] Postage cost for ' + selectedService + (isDDP ? ' DDP' : '') + ': $' + postageAmount);
+      const packageResponse = [];
+      const errors = [];
+      let orderCost = 0;
+      let masterTrk = '';
 
-      const dhlReq = {
-        pickup:             DHL_PICKUP_ID,
-        distributionCenter: DHL_DISTRIBUTION,
-        orderedProductId:   selectedService,
-        returnAddress:      buildReturnAddress(order.shipFrom),
-        packageDetail: {
-          packageId,
-          packageDescription: order.shipmentOrderCode || 'Shipment',
-          weight: { unitOfMeasure: 'LB', value: weightLB },
-          ...(l > 0 && w > 0 && h > 0 && {
-            dimension: { length:l, width:w, height:h, unitOfMeasure:(dims.Units||dims.units||'IN').toUpperCase() },
-          }),
-        },
-        consigneeAddress: {
-          name:        toContact.name    || '',
-          companyName: toContact.company || '',
-          address1:    shipTo.address1   || '',
-          address2:    shipTo.address2   || '',
-          city:        shipTo.city       || '',
-          state:       shipTo.state      || '',
-          postalCode:  shipTo.postalCode || '',
-          country:     shipTo.country    || 'US',
-          phone:       toContact.phone   || '',
-          email:       toContact.email   || '',
-        },
-      };
+      // One DHL label per box; each box declares only its own products.
+      for (let i = 0; i < boxes.length; i++) {
+        const box = boxes[i];
+        const seq = box.packageSequenceNumber ?? i;
+        const weightLB  = weightToLB(box.weight?.Value || box.weight?.value, box.weight?.Units || box.weight?.units);
+        const dims = box.dimensions || {};
+        const l = parseFloat(dims.Length || dims.length || 0);
+        const w = parseFloat(dims.Width  || dims.width  || 0);
+        const h = parseFloat(dims.Height || dims.height || 0);
+        const packageId = ((order.shipmentOrderCode||'').replace(/[^A-Za-z0-9]/g,'').slice(0,12) + seq + Date.now()).slice(0,30);
 
-      if (isInternational) {
-        console.log('[CREATE-LABEL] International shipment → country=' + shipTo.country + (isDDP ? ' DDP=true' : ''));
-        dhlReq.packageDetail.shippingCost = {
-          currency:      order.currency || 'USD',
-          declaredValue: parseFloat(order.shipmentOrderTotalPrice || 0),
-          ...(isDDP && { dutiesPaid: true }),
+        const postageAmount = await getRateForService(token, order, weightLB, dims, selectedService, box);
+        console.log('[CREATE-LABEL] box ' + seq + ' postage ' + selectedService + (isDDP ? ' DDP' : '') + ': $' + postageAmount);
+
+        const dhlReq = {
+          pickup:             DHL_PICKUP_ID,
+          distributionCenter: DHL_DISTRIBUTION,
+          orderedProductId:   selectedService,
+          returnAddress:      buildReturnAddress(order.shipFrom),
+          packageDetail: {
+            packageId,
+            packageDescription: order.shipmentOrderCode || 'Shipment',
+            weight: { unitOfMeasure: 'LB', value: weightLB },
+            ...(l > 0 && w > 0 && h > 0 && {
+              dimension: { length:l, width:w, height:h, unitOfMeasure:(dims.Units||dims.units||'IN').toUpperCase() },
+            }),
+          },
+          consigneeAddress: {
+            name:        toContact.name    || '',
+            companyName: toContact.company || '',
+            address1:    shipTo.address1   || '',
+            address2:    shipTo.address2   || '',
+            city:        shipTo.city       || '',
+            state:       shipTo.state      || '',
+            postalCode:  shipTo.postalCode || '',
+            country:     shipTo.country    || 'US',
+            phone:       toContact.phone   || '',
+            email:       toContact.email   || '',
+          },
         };
-        const customs = buildCustomsDetails(order.internationalOptions?.customsItems, order.currency);
-        if (customs) {
-          dhlReq.customsDetails = customs;
-        } else {
-          console.warn('[CREATE-LABEL] ⚠ International order but NO customs items found');
-        }
-      }
 
-      // DHL label format is driven by query param: ?format=PDF or ?format=ZPL
-      const labelUrl = DHL_BASE_URL + '/shipping/v4/label?format=' + labelFmt.queryParam;
-      logRequest('CREATE-LABEL', 'POST', labelUrl, { Authorization: 'Bearer ***', 'Content-Type': 'application/json' }, dhlReq);
-
-      try {
-        const dhlRes = await axios.post(labelUrl, dhlReq, {
-          headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-        });
-
-        // Log response with label data size instead of full base64
-        const logSafeData = JSON.parse(JSON.stringify(dhlRes.data));
-        if (Array.isArray(logSafeData.labels)) {
-          logSafeData.labels = logSafeData.labels.map(lbl => ({
-            ...lbl,
-            labelData: lbl.labelData ? '[BASE64 ' + Buffer.from(lbl.labelData, 'base64').length + ' bytes]' : undefined,
-          }));
-        }
-        logResponse('CREATE-LABEL', dhlRes.status, logSafeData);
-
-        const d     = dhlRes.data;
-        const label = Array.isArray(d.labels) ? d.labels[0] : d;
-
-        const trk = isInternational
-          ? (label.packageId || label.dhlPackageId || packageId)
-          : (stripUspsPrefix(label.trackingId) || label.dhlPackageId || packageId);
-        console.log('[CREATE-LABEL] trackingId raw=' + label.trackingId + ' dhlPackageId=' + label.dhlPackageId + ' packageId=' + label.packageId + ' → trk=' + trk);
-
-        if (label.labelData) {
-          labelCache[trk] = {
-            labelData:         label.labelData,
-            encodeType:        label.encodeType || 'BASE64',
-            format:            labelFmt.format,
-            mimeType:          labelFmt.mimeType,
-            originalPackageId: packageId,
+        if (isInternational) {
+          const { customs, declaredValue } = boxCustomsAndValue(order, box);
+          dhlReq.packageDetail.shippingCost = {
+            currency:      rateCurrency,
+            declaredValue,
+            ...(isDDP && { dutiesPaid: true }),
           };
-          console.log('[CREATE-LABEL] Label cached → key=' + trk + ' format=' + labelFmt.format);
-        } else {
-          console.warn('[CREATE-LABEL] ⚠ DHL response contained no labelData field');
+          if (customs) dhlReq.customsDetails = customs;
+          else console.warn('[CREATE-LABEL] ⚠ International order but NO customs/products for box ' + seq);
         }
 
-        const proxyLabelUrl = MIDDLEWARE_URL + '/label/' + trk;
-        console.log('[CREATE-LABEL] SUCCESS tracking=' + trk + ' cost=$' + postageAmount + ' format=' + labelFmt.format + ' labelUrl=' + proxyLabelUrl);
+        const labelUrl = DHL_BASE_URL + '/shipping/v4/label?format=' + labelFmt.queryParam;
+        logRequest('CREATE-LABEL', 'POST', labelUrl, {}, dhlReq);
 
-        out.push({
-          shipmentOrderIdentifier: order.shipmentOrderIdentifier,
-          shipmentOrderCode:       order.shipmentOrderCode,
-          carrier:        order.carrier || 'DHLEC',
-          shippingOption: order.shippingOption,
-          packageResponse: [{
-            packageSequenceNumber: pkg.packageSequenceNumber || 0,
+        try {
+          const dhlRes = await axios.post(labelUrl, dhlReq, {
+            headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          });
+
+          // Log response with label data size instead of full base64
+          const logSafeData = JSON.parse(JSON.stringify(dhlRes.data));
+          if (Array.isArray(logSafeData.labels)) {
+            logSafeData.labels = logSafeData.labels.map(lbl => ({
+              ...lbl,
+              labelData: lbl.labelData ? '[BASE64 ' + Buffer.from(lbl.labelData, 'base64').length + ' bytes]' : undefined,
+            }));
+          }
+          logResponse('CREATE-LABEL', dhlRes.status, logSafeData);
+
+          const d     = dhlRes.data;
+          const label = Array.isArray(d.labels) ? d.labels[0] : d;
+
+          const trk = isInternational
+            ? (label.packageId || label.dhlPackageId || packageId)
+            : (stripUspsPrefix(label.trackingId) || label.dhlPackageId || packageId);
+
+          if (label.labelData) {
+            labelCache[trk] = {
+              labelData:         label.labelData,
+              encodeType:        label.encodeType || 'BASE64',
+              format:            labelFmt.format,
+              mimeType:          labelFmt.mimeType,
+              originalPackageId: packageId,
+            };
+            console.log('[CREATE-LABEL] box ' + seq + ' cached → key=' + trk + ' format=' + labelFmt.format);
+          } else {
+            console.warn('[CREATE-LABEL] ⚠ box ' + seq + ' DHL response contained no labelData field');
+          }
+
+          const proxyLabelUrl = MIDDLEWARE_URL + '/label/' + trk;
+          console.log('[CREATE-LABEL] box ' + seq + ' SUCCESS tracking=' + trk + ' cost=$' + postageAmount);
+          orderCost += parseFloat(postageAmount) || 0;
+          if (!masterTrk) masterTrk = trk;
+
+          packageResponse.push({
+            packageSequenceNumber: seq,
             trackingNumber:        trk,
             encodedLabel:          label.labelData || '',
             labelURL:              proxyLabelUrl,
             trackingUrl:           null,
             rateDetail: {
-              totalCost:    postageAmount,
-              shippingCost: postageAmount,
+              totalCost:    parseFloat(postageAmount) || 0,
+              shippingCost: parseFloat(postageAmount) || 0,
               otherCost:    0,
               currency:     rateCurrency,
             },
             externalReference: packageId,
-          }],
-          rateDetail: {
-            totalCost:    postageAmount,
-            shippingCost: postageAmount,
-            otherCost:    0,
-            currency:     rateCurrency,
-          },
-          masterTrackingNumber: trk,
-          isSuccessful: true,
-          message:      [],
-        });
-
-      } catch (e) {
-        logError('CREATE-LABEL', e);
-        const errData = e.response?.data;
-        let em = errData?.detail || errData?.title || e.message;
-        if (Array.isArray(errData?.invalidParams) && errData.invalidParams.length) {
-          em = errData.invalidParams.map(p => p.name + ': ' + p.reason).join(' | ');
+          });
+        } catch (e) {
+          logError('CREATE-LABEL', e);
+          const errData = e.response?.data;
+          let em = errData?.detail || errData?.title || e.message;
+          if (Array.isArray(errData?.invalidParams) && errData.invalidParams.length) {
+            em = errData.invalidParams.map(p => p.name + ': ' + p.reason).join(' | ');
+          }
+          errors.push('Box ' + seq + ': ' + em);
         }
-        out.push({
-          shipmentOrderIdentifier: order.shipmentOrderIdentifier,
-          shipmentOrderCode:       order.shipmentOrderCode,
-          carrier:        order.carrier || 'DHLEC',
-          shippingOption: order.shippingOption,
-          packageResponse: [],
-          rateDetail: { totalCost:0, shippingCost:0, otherCost:0, currency:'USD' },
-          masterTrackingNumber: '',
-          isSuccessful: false,
-          message: ['DHL error: ' + em],
-        });
       }
+
+      const allOk = packageResponse.length === boxes.length && errors.length === 0;
+      console.log('[CREATE-LABEL] ' + order.shipmentOrderCode + ' → ' + packageResponse.length + '/' + boxes.length + ' labels, cost=$' + round2(orderCost) + (allOk ? ' OK' : ' PARTIAL/FAIL'));
+
+      out.push({
+        shipmentOrderIdentifier: order.shipmentOrderIdentifier,
+        shipmentOrderCode:       order.shipmentOrderCode,
+        carrier:        order.carrier || 'DHLEC',
+        shippingOption: order.shippingOption,
+        packageResponse,
+        rateDetail: {
+          totalCost:    round2(orderCost),
+          shippingCost: round2(orderCost),
+          otherCost:    0,
+          currency:     rateCurrency,
+        },
+        masterTrackingNumber: masterTrk,
+        isSuccessful: allOk,
+        message:      errors,
+      });
     }
 
     const logiwaResponse = { data: [out[0]] };
@@ -735,7 +816,7 @@ app.post('/end-of-day-report', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log('\n🚀 DHL eCommerce-Logiwa Middleware v2.4.6 on port ' + PORT);
+  console.log('\n🚀 DHL eCommerce-Logiwa Middleware v2.5.0 on port ' + PORT);
   console.log('   Label proxy  : ' + MIDDLEWARE_URL + '/label/:id');
   console.log('   Pickup ID    : ' + DHL_PICKUP_ID);
   console.log('   Distribution : ' + DHL_DISTRIBUTION);
