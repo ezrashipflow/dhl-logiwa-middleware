@@ -169,31 +169,67 @@ function buildCustomsDetails(customsItems, currency) {
   });
 }
 
+// True per-unit customs value per SKU for the whole order. Logiwa repeats a
+// SKU's FULL line declaredValue in every box that contains it (with that box's
+// quantity), so dividing a box's lineTotal by the box quantity over-declares a
+// split SKU in each box. We instead derive per-unit = full line ÷ TOTAL order
+// quantity, so the same SKU declares the same per-unit value in every box and
+// the boxes sum to the true order value. Prefer the order-level customsItems
+// rollup; fall back to summing quantities across the boxes' products.
+function orderUnitValues(order) {
+  const lineTotal = {};  // sku -> full line declaredValue
+  const totalQty  = {};  // sku -> total quantity across the order
+
+  const items = order.internationalOptions?.customsItems;
+  if (Array.isArray(items) && items.length) {
+    for (const it of items) {
+      if (!it.sku) continue;
+      lineTotal[it.sku] = parseFloat(it.declaredValue) || 0;
+      totalQty[it.sku]  = parseInt(it.quantity) || 1;
+    }
+  } else {
+    // No order-level rollup: reconstruct from the boxes. Each box carries the
+    // SKU's full line value, so take it once and sum quantities across boxes.
+    for (const box of (order.requestedPackageLineItems || [])) {
+      for (const p of (box.products || [])) {
+        if (!p.sku) continue;
+        lineTotal[p.sku] = parseFloat(p.declaredValue) || 0;
+        totalQty[p.sku]  = (totalQty[p.sku] || 0) + (parseInt(p.quantity) || 0);
+      }
+    }
+  }
+
+  const map = {};
+  for (const sku of Object.keys(lineTotal)) {
+    const q = totalQty[sku] || 1;
+    map[sku] = Math.round((lineTotal[sku] / q) * 100) / 100;
+  }
+  return map;
+}
+
 // requestedPackageLineItems[].products[] = the items actually packed in THAT
 // box. internationalOptions.customsItems[] is the order-level rollup of all
-// boxes' products. For multi-box international shipments we must declare each
-// box's own products — not the whole order on every box.
-function buildCustomsFromProducts(products, currency) {
+// boxes' products. For multi-box international shipments we declare each box's
+// own products — not the whole order on every box. itemValue is PER-UNIT (DHL
+// multiplies by packagedQuantity); we use the order-wide per-unit value so a
+// split SKU isn't over-declared in each box.
+function buildCustomsFromProducts(products, currency, unitValues) {
   if (!Array.isArray(products) || !products.length) return null;
   return products.map(item => {
-    // itemValue is PER-UNIT (DHL multiplies by packagedQuantity); Logiwa sends
-    // declaredValue as the line total, so divide by quantity. See note above.
     const qty       = parseInt(item.quantity) || 1;
     const lineTotal = parseFloat(item.declaredValue) || 0;
+    const perUnit   = (unitValues && item.sku != null && unitValues[item.sku] != null)
+      ? unitValues[item.sku]
+      : Math.round((lineTotal / qty) * 100) / 100;
     return {
       itemDescription:  (item.description || 'Merchandise').slice(0, 50),
       packagedQuantity: qty,
-      itemValue:        Math.round((lineTotal / qty) * 100) / 100,
+      itemValue:        perUnit,
       currency:         currency || 'USD',
       countryOfOrigin:  item.originCountryCode || 'US',
       ...(item.hsTariffCode && { hsCode: item.hsTariffCode }),
     };
   });
-}
-
-function sumDeclaredValue(products) {
-  if (!Array.isArray(products)) return 0;
-  return Math.round(products.reduce((s, p) => s + (parseFloat(p.declaredValue) || 0), 0) * 100) / 100;
 }
 
 // Always returns an array of at least one box, so callers can loop uniformly.
@@ -204,16 +240,22 @@ function getBoxes(order) {
 
 // Per-box customs + declaredValue for an international shipment. Prefers the
 // box's own products[]; falls back to order-level customsItems / order total
-// only when a box has no products[].
+// only when a box has no products[]. declaredValue is summed from the same
+// per-unit values DHL sees (Σ itemValue × packagedQuantity), so the box's
+// declared value reflects only its own contents and the boxes sum to the order.
 function boxCustomsAndValue(order, box) {
   const hasProducts = box && Array.isArray(box.products) && box.products.length;
-  const customs = hasProducts
-    ? buildCustomsFromProducts(box.products, order.currency)
-    : buildCustomsDetails(order.internationalOptions?.customsItems, order.currency);
-  const declaredValue = hasProducts
-    ? sumDeclaredValue(box.products)
-    : parseFloat(order.shipmentOrderTotalPrice || 0);
-  return { customs, declaredValue };
+  if (hasProducts) {
+    const customs = buildCustomsFromProducts(box.products, order.currency, orderUnitValues(order));
+    const declaredValue = Math.round(
+      customs.reduce((s, c) => s + c.itemValue * c.packagedQuantity, 0) * 100
+    ) / 100;
+    return { customs, declaredValue };
+  }
+  return {
+    customs:       buildCustomsDetails(order.internationalOptions?.customsItems, order.currency),
+    declaredValue: parseFloat(order.shipmentOrderTotalPrice || 0),
+  };
 }
 
 /**
@@ -683,7 +725,8 @@ app.post('/create-label', async (req, res) => {
     }
 
     const logiwaResponse = { data: [out[0]] };
-    console.log('[CREATE-LABEL] → Response to Logiwa: tracking=' + out[0]?.masterTrackingNumber + ' success=' + out[0]?.isSuccessful);
+    const allTrk = (out[0]?.packageResponse || []).map(p => p.trackingNumber).join(', ');
+    console.log('[CREATE-LABEL] → Response to Logiwa: ' + (out[0]?.packageResponse?.length || 0) + ' label(s) [' + allTrk + '] master=' + out[0]?.masterTrackingNumber + ' success=' + out[0]?.isSuccessful);
     return res.json(logiwaResponse);
 
   } catch (err) {
