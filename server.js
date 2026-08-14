@@ -489,22 +489,30 @@ app.post('/get-rate', async (req, res) => {
           });
         });
 
-        if (isDDP) {
-          const plt = svc['PLT'];
-          if (plt && plt.count === nBoxes) {
-            rateList = [{
-              carrier:        order.carrier || 'DHLEC',
-              shippingOption: 'PLT-DDP',
-              totalCost:      round2(plt.cost),
-              shippingCost:   round2(plt.cost),
-              otherCost:      0,
-              currency:       plt.currency,
-              estimatedDays:  plt.estDays,
-            }];
-            console.log('[GET-RATE] PLT-DDP rate (' + nBoxes + ' boxes): $' + round2(plt.cost));
-          } else {
-            msg = 'PLT service not available for all boxes — DDP not supported for this shipment';
-          }
+        // DDP-first for international shipments. DHL offers the duties-paid
+        // "Direct" (PLT) product only for certain countries. When it does, we
+        // return ONLY PLT-DDP so Logiwa can't rate-shop down to a duties-unpaid
+        // service and leave the customer holding the duty bill. When DHL does
+        // not offer PLT for the route (a DDU-only country), we fall back to the
+        // full duties-unpaid menu — unchanged behavior. Verified against the
+        // live DHL rating API: dutiesPaid does not change quoted prices, so the
+        // single pricing pass above already gives us PLT's cost — no extra call.
+        const plt      = svc['PLT'];
+        const pltAvail = plt && plt.count === nBoxes;
+        if (isIntl && pltAvail) {
+          rateList = [{
+            carrier:        order.carrier || 'DHLEC',
+            shippingOption: 'PLT-DDP',
+            totalCost:      round2(plt.cost),
+            shippingCost:   round2(plt.cost),
+            otherCost:      0,
+            currency:       plt.currency,
+            estimatedDays:  plt.estDays,
+          }];
+          console.log('[GET-RATE] DDP-first → PLT-DDP $' + round2(plt.cost) + ' for ' + (shipTo.country || '?') + ' (' + nBoxes + ' boxes)');
+        } else if (isDDP) {
+          // Explicit PLT-DDP request but Direct is not offered for this route.
+          msg = 'PLT service not available for all boxes — DDP not supported for this shipment';
         } else {
           rateList = Object.entries(svc)
             .filter(([, v]) => v.count === nBoxes)
