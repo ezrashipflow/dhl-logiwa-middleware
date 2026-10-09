@@ -7,6 +7,7 @@
  *     DHL products allowed to carry it are offered — Ground for Limited
  *     Quantity — and a label on any other service is refused. International
  *     hazmat is Parcel Direct to Canada / Mexico only; anywhere else is blocked.
+ *   - Ground (GND) is offered to Logiwa's rate shop only for hazmat orders.
  *
  * Changes in v2.5.0 (from v2.4.6):
  *   - MULTI-BOX support: /get-rate and /create-label now loop over every
@@ -289,6 +290,8 @@ function boxCustomsAndValue(order, box) {
 const DG_DEFAULT_CATEGORY = process.env.DHL_DG_DEFAULT_CATEGORY || '08';
 const DG_ALL_SERVICES  = ['GND', 'EXP', 'MAX'];
 const DG_INTL_COUNTRIES = ['CA', 'MX'];
+// The DHL product offered to Logiwa only when the order holds hazmat.
+const HAZMAT_ONLY_SERVICE = 'GND';
 
 function isHazmatLine(p) {
   return !!p && (p.isHazardous === true || String(p.isHazardous).toLowerCase() === 'true'
@@ -721,6 +724,14 @@ app.post('/get-rate', async (req, res) => {
               delete svc[id];
             }
           }
+        }
+
+        // Ground is for hazmat only. It is the cheapest DHL product, so if it
+        // were offered on ordinary orders it would win every rate shop — and we
+        // ship those Expedited. A non-hazmat order is never offered Ground.
+        if (!dg.isHazmat && svc[HAZMAT_ONLY_SERVICE]) {
+          console.log('[GET-RATE] not hazmat — ' + HAZMAT_ONLY_SERVICE + ' $' + round2(svc[HAZMAT_ONLY_SERVICE].cost) + ' withheld from the rate shop');
+          delete svc[HAZMAT_ONLY_SERVICE];
         }
 
         // DDP-first for international shipments. DHL offers the duties-paid
