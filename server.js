@@ -368,6 +368,108 @@ function orderDangerousGoods(order, boxes, isIntl, country) {
 
 function hazmatError(message) { return Object.assign(new Error(message), { hazmat: true }); }
 
+// ─── LIMITED QUANTITY MARK ────────────────────────────────────────────────────
+// A hazmat carton must carry the Limited Quantity mark (49 CFR §172.315): a
+// square on point, top and bottom corners black, centre white. We print it as
+// a second label straight after the shipping label, in the same file, so the
+// packer gets both from one print.
+//
+// Size: the rule is 100 mm per side, or no less than 50 mm where the package
+// is too small for that. A 4x6 label is 101.6 mm wide, so the largest mark it
+// can hold is about 63 mm per side — the reduced size, right for small parcels.
+//
+// Lithium batteries take the lithium battery mark instead, which needs a UN
+// number and phone number; we do not print that one.
+
+const LITHIUM_UN = ['3480', '3481', '3090', '3091'];
+
+// Does this box hold hazmat that takes the Limited Quantity mark? Uses the
+// box's own products[]; when Logiwa sends none, the order's items stand in.
+function needsLimitedQuantityMark(order, box) {
+  const own = box && Array.isArray(box.products) && box.products.length ? box.products : null;
+  return (own || orderProducts(order)).filter(isHazmatLine).some(p =>
+    !LITHIUM_UN.includes(String(p.hazmatIdentificationNumber || '').replace(/\D/g, '')));
+}
+
+// The mark as plain geometry, in whatever unit the caller draws in.
+//   r = half the diagonal, t = border thickness, a = half-height of the white band
+function lqGeometry(width, height, margin, t) {
+  const r  = Math.min(width, height) / 2 - margin;
+  const cx = width / 2, cy = height / 2;
+  const a  = r * 0.5;
+  const ri = r - t * Math.SQRT2;          // inner (white) diamond, inset by the border
+  return { r, cx, cy, a, ri, t };
+}
+
+async function lqMarkPdf(pdfBase64, caption) {
+  const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
+  const doc   = await PDFDocument.load(Buffer.from(pdfBase64, 'base64'));
+  const first = doc.getPage(0).getSize();
+  const page  = doc.addPage([first.width, first.height]);
+  const { width: W, height: H } = first;
+  const mm = 72 / 25.4;
+  const g  = lqGeometry(W, H, 6 * mm, 2 * mm);
+  const P  = (pts) => 'M ' + pts.map(([x, y]) => x.toFixed(2) + ' ' + y.toFixed(2)).join(' L ') + ' Z';
+  // SVG path space: origin top-left of the page, y down.
+  const at = { x: 0, y: H };
+  page.drawSvgPath(P([[g.cx, g.cy - g.r], [g.cx + g.r, g.cy], [g.cx, g.cy + g.r], [g.cx - g.r, g.cy]]), { ...at, color: rgb(0, 0, 0) });
+  const w = g.ri - g.a;                    // half-width of the white band at its top and bottom
+  page.drawSvgPath(P([[g.cx - w, g.cy - g.a], [g.cx + w, g.cy - g.a], [g.cx + g.ri, g.cy], [g.cx + w, g.cy + g.a], [g.cx - w, g.cy + g.a], [g.cx - g.ri, g.cy]]), { ...at, color: rgb(1, 1, 1) });
+  const font = await doc.embedFont(StandardFonts.HelveticaBold);
+  const size = 14;
+  page.drawText(caption, { x: (W - font.widthOfTextAtSize(caption, size)) / 2, y: 7 * mm, size, font, color: rgb(0, 0, 0) });
+  return Buffer.from(await doc.save()).toString('base64');
+}
+
+// Carriers hand ZPL back either as plain text or base64; return it the same way.
+function lqMarkZpl(label, caption) {
+  const plain = String(label).includes('^XA');
+  const zpl   = plain ? String(label) : Buffer.from(String(label), 'base64').toString('utf8');
+  if (!zpl.includes('^XA')) throw new Error('label is not ZPL text');
+  // Match the printer resolution of the carrier's own label: ^PW is its width in dots.
+  const pw  = parseInt((zpl.match(/\^PW(\d+)/) || [])[1], 10) || 812;
+  const dpm = pw / 101.6;                  // dots per mm on a 4-inch-wide label
+  const W = pw, H = Math.round(pw * 1.5);
+  const g = lqGeometry(W, H, 6 * dpm, 2 * dpm);
+  const step = 3;                          // strip height in dots
+  const bar  = Math.round(g.t * Math.SQRT2);
+  const out  = ['^XA', '^PW' + W, '^LL' + H, '^LH0,0'];
+  const strip = (x, y, w) => out.push('^FO' + Math.round(x) + ',' + Math.round(y) + '^GB' + Math.max(Math.round(w), 1) + ',' + step + ',' + step + '^FS');
+  for (let y = g.cy - g.r; y < g.cy + g.r; y += step) {
+    const hw = g.r - Math.abs(y + step / 2 - g.cy);   // half-width of the diamond on this row
+    if (hw <= 0) continue;
+    if (Math.abs(y + step / 2 - g.cy) >= g.a || hw * 2 <= bar * 2) {
+      strip(g.cx - hw, y, hw * 2);                     // black corner: full width
+    } else {
+      strip(g.cx - hw, y, bar);                        // white band: just the two borders
+      strip(g.cx + hw - bar, y, bar);
+    }
+  }
+  out.push('^FO0,' + Math.round(H - 14 * dpm) + '^A0N,' + Math.round(5 * dpm) + ',' + Math.round(5 * dpm) + '^FB' + W + ',1,0,C^FD' + caption.replace(/[\^~\\]/g, ' ') + '^FS', '^XZ');
+  const both = zpl.replace(/\s+$/, '') + '\n' + out.join('\n') + '\n';
+  return plain ? both : Buffer.from(both).toString('base64');
+}
+
+// The shipping label with the Limited Quantity mark added after it, when the
+// box needs one. The shipping label is already bought by the time this runs,
+// so any failure here hands the original label back untouched.
+async function withLimitedQuantityMark(tag, label, format, order, box) {
+  if (!label || !needsLimitedQuantityMark(order, box)) return label;
+  const fmt = String(format || '').toLowerCase();
+  const caption = 'LIMITED QUANTITY - ' + (order.shipmentOrderCode || '');
+  try {
+    let out;
+    if (fmt.includes('zpl')) out = lqMarkZpl(label, caption);
+    else if (fmt.includes('pdf')) out = await lqMarkPdf(label, caption);
+    else throw new Error('cannot add a label to ' + (format || 'unknown') + ' format');
+    console.log('[' + tag + '] Limited Quantity mark added after the shipping label (' + fmt + ')');
+    return out;
+  } catch (e) {
+    console.warn('[' + tag + '] ⚠ could not add the Limited Quantity mark — apply one by hand: ' + e.message);
+    return label;
+  }
+}
+
 /**
  * Resolve label format from Logiwa labelSpecification.
  * DHL label endpoint accepts format as a query param: ?format=PDF or ?format=ZPL
@@ -813,6 +915,7 @@ app.post('/create-label', async (req, res) => {
 
           const d     = dhlRes.data;
           const label = Array.isArray(d.labels) ? d.labels[0] : d;
+          label.labelData = await withLimitedQuantityMark('CREATE-LABEL', label.labelData, labelFmt.format, order, box);
 
           const trk = isInternational
             ? (label.packageId || label.dhlPackageId || packageId)
