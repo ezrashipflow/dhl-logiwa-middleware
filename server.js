@@ -288,6 +288,21 @@ function boxCustomsAndValue(order, box) {
 
 // A hazmat product with no lithium UN number is declared as this category.
 const DG_DEFAULT_CATEGORY = process.env.DHL_DG_DEFAULT_CATEGORY || '08';
+
+// 09 Small Quantity Provision is 49 CFR 173.4: inner containers of 30 mL / 30 g
+// or less, domestic ground only, no Limited Quantity mark. Logiwa has no
+// "small quantity" Hazmat Type, so a product opts in with one of these Hazmat
+// Types (EQ, Excepted Quantity, by default) or by naming 173.4 / "small
+// quantity" in its shipping name.
+const DG_SMALL_QTY_CATEGORY = '09';
+const DG_SMALL_QTY_TYPES = (process.env.DHL_DG_SMALL_QTY_TYPES || 'EQ')
+  .split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+
+function isSmallQuantityLine(p) {
+  const type = String(p.hazmatTypeName || p.hazmatType || '').trim().toUpperCase();
+  return DG_SMALL_QTY_TYPES.includes(type)
+    || /173\.4\b|small\s+quantit/i.test(p.hazmatShippingName || '');
+}
 const DG_ALL_SERVICES  = ['GND', 'EXP', 'MAX'];
 const DG_INTL_COUNTRIES = ['CA', 'MX'];
 // The DHL product offered to Logiwa only when the order holds hazmat.
@@ -308,6 +323,7 @@ function dgCategoryForLine(p) {
   if (un === '3091') return contained ? '01' : '02';
   if (un === '3480') return '06';
   if (un === '3481') return contained ? '04' : '05';
+  if (isSmallQuantityLine(p)) return DG_SMALL_QTY_CATEGORY;
   return DG_DEFAULT_CATEGORY;
 }
 
@@ -381,17 +397,35 @@ function hazmatError(message) { return Object.assign(new Error(message), { hazma
 // is too small for that. A 4x6 label is 101.6 mm wide, so the largest mark it
 // can hold is about 63 mm per side — the reduced size, right for small parcels.
 //
+// Small Quantity (09) boxes take no diamond. 49 CFR 173.4(a)(10) has the
+// shipper certify by marking the package with the statement below, so we
+// print that in its place.
+//
 // Lithium batteries take the lithium battery mark instead, which needs a UN
 // number and phone number; we do not print that one.
 
 const LITHIUM_UN = ['3480', '3481', '3090', '3091'];
+const SMALL_QTY_STATEMENT = 'This package conforms to 49 CFR 173.4 for domestic highway or rail transport only.';
 
-// Does this box hold hazmat that takes the Limited Quantity mark? Uses the
-// box's own products[]; when Logiwa sends none, the order's items stand in.
-function needsLimitedQuantityMark(order, box) {
-  const own = box && Array.isArray(box.products) && box.products.length ? box.products : null;
-  return (own || orderProducts(order)).filter(isHazmatLine).some(p =>
-    !LITHIUM_UN.includes(String(p.hazmatIdentificationNumber || '').replace(/\D/g, '')));
+// Which mark this box's hazmat takes: 'LQ', 'SQ' or null. Uses the box's own
+// products[]; when Logiwa sends none, the order's items stand in.
+function hazmatMarkFor(order, box) {
+  const own   = box && Array.isArray(box.products) && box.products.length ? box.products : null;
+  const lines = (own || orderProducts(order)).filter(isHazmatLine)
+    .filter(p => !LITHIUM_UN.includes(String(p.hazmatIdentificationNumber || '').replace(/\D/g, '')));
+  if (!lines.length) return null;
+  return lines.every(p => dgCategoryForLine(p) === DG_SMALL_QTY_CATEGORY) ? 'SQ' : 'LQ';
+}
+
+// Breaks text into lines no wider than `room` at the given size.
+function wrapText(text, measure, room) {
+  const out = [];
+  for (const word of text.split(/\s+/).filter(Boolean)) {
+    const last = out[out.length - 1];
+    if (last !== undefined && measure(last + ' ' + word) <= room) out[out.length - 1] = last + ' ' + word;
+    else out.push(word);
+  }
+  return out;
 }
 
 // The mark as plain geometry, in whatever unit the caller draws in.
@@ -430,6 +464,50 @@ async function lqMarkPdf(pdfBase64, caption) {
   return Buffer.from(await doc.save()).toString('base64');
 }
 
+// The Small Quantity page: the 173.4 statement, large and centred, with the
+// order code under it.
+async function sqMarkPdf(pdfBase64, orderCode) {
+  const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
+  const doc   = await PDFDocument.load(Buffer.from(pdfBase64, 'base64'));
+  const { width: W, height: H } = doc.getPage(0).getSize();
+  const page  = doc.addPage([W, H]);
+  const mm    = 72 / 25.4;
+  const font  = await doc.embedFont(StandardFonts.HelveticaBold);
+  const room  = W - 2 * 8 * mm;
+  const size  = 20;
+  const lines = wrapText(SMALL_QTY_STATEMENT, l => font.widthOfTextAtSize(l, size), room);
+  const lead  = size * 1.3;
+  let y = H / 2 + (lines.length * lead) / 2;
+  page.drawRectangle({ x: 5 * mm, y: y - lines.length * lead - 4 * mm, width: W - 10 * mm, height: lines.length * lead + 10 * mm, borderColor: rgb(0, 0, 0), borderWidth: 2 });
+  for (const line of lines) {
+    y -= lead;
+    page.drawText(line, { x: (W - font.widthOfTextAtSize(line, size)) / 2, y: y + lead * 0.25, size, font, color: rgb(0, 0, 0) });
+  }
+  if (orderCode) {
+    let s = 14;
+    while (s > 6 && font.widthOfTextAtSize(orderCode, s) > W - 8 * mm) s -= 0.5;
+    page.drawText(orderCode, { x: (W - font.widthOfTextAtSize(orderCode, s)) / 2, y: 7 * mm, size: s, font, color: rgb(0, 0, 0) });
+  }
+  return Buffer.from(await doc.save()).toString('base64');
+}
+
+function sqMarkZpl(label, orderCode) {
+  const plain = String(label).includes('^XA');
+  const zpl   = plain ? String(label) : Buffer.from(String(label), 'base64').toString('utf8');
+  if (!zpl.includes('^XA')) throw new Error('label is not ZPL text');
+  const pw  = parseInt((zpl.match(/\^PW(\d+)/) || [])[1], 10) || 812;
+  const dpm = pw / 101.6;
+  const W = pw, H = Math.round(pw * 1.5);
+  const clean = s => String(s).replace(/[\^~\\]/g, ' ');
+  const out = ['^XA', '^PW' + W, '^LL' + H, '^LH0,0',
+    '^FO' + Math.round(5 * dpm) + ',' + Math.round(H / 2 - 30 * dpm) + '^GB' + Math.round(W - 10 * dpm) + ',' + Math.round(60 * dpm) + ',' + Math.round(0.7 * dpm) + '^FS',
+    '^FO' + Math.round(8 * dpm) + ',' + Math.round(H / 2 - 24 * dpm) + '^A0N,' + Math.round(7 * dpm) + ',' + Math.round(7 * dpm) + '^FB' + Math.round(W - 16 * dpm) + ',6,' + Math.round(1.5 * dpm) + ',C^FD' + clean(SMALL_QTY_STATEMENT) + '^FS'];
+  if (orderCode) out.push('^FO' + Math.round(4 * dpm) + ',' + Math.round(H - 18 * dpm) + '^A0N,' + Math.round(5 * dpm) + ',' + Math.round(5 * dpm) + '^FB' + Math.round(W - 8 * dpm) + ',2,' + Math.round(dpm) + ',C^FD' + clean(orderCode) + '^FS');
+  out.push('^XZ');
+  const both = zpl.replace(/\s+$/, '') + '\n' + out.join('\n') + '\n';
+  return plain ? both : Buffer.from(both).toString('base64');
+}
+
 // Carriers hand ZPL back either as plain text or base64; return it the same way.
 function lqMarkZpl(label, caption) {
   const plain = String(label).includes('^XA');
@@ -462,23 +540,27 @@ function lqMarkZpl(label, caption) {
   return plain ? both : Buffer.from(both).toString('base64');
 }
 
-// The shipping label with the Limited Quantity mark added after it, when the
-// box needs one. The shipping label is already bought by the time this runs,
-// so any failure here hands the original label back untouched.
+// The shipping label with the box's hazmat mark added after it: the Limited
+// Quantity diamond, or the 173.4 statement for Small Quantity. The shipping
+// label is already bought by the time this runs, so any failure here hands
+// the original label back untouched.
 async function withLimitedQuantityMark(tag, label, format, order, box) {
-  if (!label || !needsLimitedQuantityMark(order, box)) return label;
-  const fmt = String(format || '').toLowerCase();
+  const mark = label && hazmatMarkFor(order, box);
+  if (!mark) return label;
+  const fmt  = String(format || '').toLowerCase();
+  const code = order.shipmentOrderCode || '';
+  const name = mark === 'SQ' ? 'Small Quantity (49 CFR 173.4) statement' : 'Limited Quantity mark';
   // Two lines, so a long order code never runs off the edge of the label.
-  const caption = ['LIMITED QUANTITY', order.shipmentOrderCode || ''].filter(Boolean);
+  const caption = ['LIMITED QUANTITY', code].filter(Boolean);
   try {
     let out;
-    if (fmt.includes('zpl')) out = lqMarkZpl(label, caption);
-    else if (fmt.includes('pdf')) out = await lqMarkPdf(label, caption);
+    if (fmt.includes('zpl')) out = mark === 'SQ' ? sqMarkZpl(label, code) : lqMarkZpl(label, caption);
+    else if (fmt.includes('pdf')) out = mark === 'SQ' ? await sqMarkPdf(label, code) : await lqMarkPdf(label, caption);
     else throw new Error('cannot add a label to ' + (format || 'unknown') + ' format');
-    console.log('[' + tag + '] Limited Quantity mark added after the shipping label (' + fmt + ')');
+    console.log('[' + tag + '] ' + name + ' added after the shipping label (' + fmt + ')');
     return out;
   } catch (e) {
-    console.warn('[' + tag + '] ⚠ could not add the Limited Quantity mark — apply one by hand: ' + e.message);
+    console.warn('[' + tag + '] ⚠ could not add the ' + name + ' — apply one by hand: ' + e.message);
     return label;
   }
 }
