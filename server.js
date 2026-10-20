@@ -565,6 +565,117 @@ async function withLimitedQuantityMark(tag, label, format, order, box) {
   }
 }
 
+// ─── ORIENTATION ARROWS ("THIS SIDE UP") ─────────────────────────────────────
+// A box holding liquid hazmat (perfume, nail polish) must carry package
+// orientation arrows on two opposite sides (49 CFR §172.312; GOFO and UniUni
+// guides §4.2.3), and the shipping label does not count as one. We print two
+// more 4x6 labels after the hazmat mark, one per side, so nothing needs cutting.
+//
+// Look approved by Ezra 2026-10-20: two arrows over a bar inside a box, about
+// 1.8 x 2.8 in, centred on a sideways (landscape) 4x6, arrows pointing up when
+// the label is turned sideways. No words — the rule asks for the symbol only.
+//
+// Liquid = class 3 (flammable liquids are always liquid), or a shipping name
+// that says liquid / solution. Aerosols (UN1950, class 2) and solids get none.
+
+function isLiquidHazmatLine(p) {
+  if (!isHazmatLine(p)) return false;
+  const un  = String(p.hazmatIdentificationNumber || '').replace(/\D/g, '');
+  const cls = (String(p.hazmatClassDivisionNumber || '').match(/\d(\.\d)?/) || [''])[0];
+  if (un === '1950' || cls.startsWith('2')) return false;
+  return cls === '3' || /liquid|solution/i.test(p.hazmatShippingName || '');
+}
+
+function needsOrientationArrows(order, box) {
+  const own = box && Array.isArray(box.products) && box.products.length ? box.products : null;
+  return (own || orderProducts(order)).some(isLiquidHazmatLine);
+}
+
+// The mark as rectangles and arrow outlines, in points on a 6x4 landscape page
+// (432 x 288), y down. Drawn as the approved sample: box 128 x 200 centred.
+function arrowShapes() {
+  const rects = [
+    // border, as four bars 4 pt thick
+    [150, 42, 132, 4], [150, 242, 132, 4], [150, 42, 4, 204], [278, 42, 4, 204],
+    [172, 207, 88, 11],                    // base bar under the arrows
+  ];
+  const arrows = [191, 241].map(cx => [
+    [cx, 63], [cx + 18, 103], [cx + 7, 103], [cx + 7, 197],
+    [cx - 7, 197], [cx - 7, 103], [cx - 18, 103],
+  ]);
+  return { rects, arrows };
+}
+
+// Two pages the same size as the shipping label. Each is turned a quarter
+// (/Rotate 90) so it shows sideways like the approved sample; on the roll the
+// arrows point to the label's left edge, the same as the ZPL version.
+async function arrowsPdf(pdfBase64) {
+  const { PDFDocument, rgb, degrees } = require('pdf-lib');
+  const doc = await PDFDocument.load(Buffer.from(pdfBase64, 'base64'));
+  const { width: W, height: H } = doc.getPage(0).getSize();
+  const s = Math.min(W / 288, H / 432);
+  const { rects, arrows } = arrowShapes();
+  // Landscape (X, Y down) → upright page (x, y down): x = Y, y = H - X.
+  const pt = ([X, Y]) => [Y * s, H - X * s];
+  const P = (pts) => 'M ' + pts.map(p => pt(p).map(n => n.toFixed(2)).join(' ')).join(' L ') + ' Z';
+  for (let i = 0; i < 2; i++) {
+    const page = doc.addPage([W, H]);
+    page.setRotation(degrees(90));
+    const at = { x: 0, y: H, color: rgb(0, 0, 0) };
+    for (const [x, y, w, h] of rects) page.drawSvgPath(P([[x, y], [x + w, y], [x + w, y + h], [x, y + h]]), at);
+    for (const a of arrows) page.drawSvgPath(P(a), at);
+  }
+  return Buffer.from(await doc.save()).toString('base64');
+}
+
+// Carriers hand ZPL back either as plain text or base64; return it the same way.
+function arrowsZpl(label) {
+  const plain = String(label).includes('^XA');
+  const zpl   = plain ? String(label) : Buffer.from(String(label), 'base64').toString('utf8');
+  if (!zpl.includes('^XA')) throw new Error('label is not ZPL text');
+  const pw = parseInt((zpl.match(/\^PW(\d+)/) || [])[1], 10) || 812;
+  const W = pw, H = Math.round(pw * 1.5);
+  const s = pw / 288;                      // dots per point on a 4-inch-wide label
+  const { rects, arrows } = arrowShapes();
+  const box = (x, y, w, h) => '^FO' + Math.round(x) + ',' + Math.round(y) + '^GB' + Math.max(Math.round(w), 1) + ',' + Math.max(Math.round(h), 1) + ',' + Math.max(Math.round(Math.min(w, h)), 1) + '^FS';
+  const page = ['^XA', '^PW' + W, '^LL' + H, '^LH0,0'];
+  // Landscape rectangle (X, Y, w, h) → upright: x = Y, y = H - X - w.
+  for (const [X, Y, w, h] of rects) page.push(box(Y * s, H - (X + w) * s, h * s, w * s));
+  for (const a of arrows) {
+    const [cx, tip] = a[0], half = a[1][0] - cx, base = a[1][1], shaft = a[2][0] - cx, end = a[3][1];
+    page.push(box(base * s, H - (cx + shaft) * s, (end - base) * s, 2 * shaft * s));   // shaft
+    // Head: columns from the tip, each as tall as the triangle is wide there.
+    const step = 3;
+    for (let Y = tip; Y < base; Y += step / s) {
+      const hw = half * (Y + step / s / 2 - tip) / (base - tip);
+      page.push(box(Y * s, H - (cx + hw) * s, step, 2 * hw * s));
+    }
+  }
+  page.push('^XZ');
+  const one  = page.join('\n');
+  const all  = zpl.replace(/\s+$/, '') + '\n' + one + '\n' + one + '\n';
+  return plain ? all : Buffer.from(all).toString('base64');
+}
+
+// The label with two orientation-arrow labels added after it, for a box of
+// liquid hazmat. The shipping label is already bought by now, so any failure
+// hands the label back as it was.
+async function withOrientationArrows(tag, label, format, order, box) {
+  if (!label || !needsOrientationArrows(order, box)) return label;
+  const fmt = String(format || '').toLowerCase();
+  try {
+    let out;
+    if (fmt.includes('zpl')) out = arrowsZpl(label);
+    else if (fmt.includes('pdf')) out = await arrowsPdf(label);
+    else throw new Error('cannot add a label to ' + (format || 'unknown') + ' format');
+    console.log('[' + tag + '] 2 orientation-arrow labels added (' + fmt + ')');
+    return out;
+  } catch (e) {
+    console.warn('[' + tag + '] ⚠ could not add the orientation arrows — apply two by hand: ' + e.message);
+    return label;
+  }
+}
+
 /**
  * Resolve label format from Logiwa labelSpecification.
  * DHL label endpoint accepts format as a query param: ?format=PDF or ?format=ZPL
@@ -1019,6 +1130,7 @@ app.post('/create-label', async (req, res) => {
           const d     = dhlRes.data;
           const label = Array.isArray(d.labels) ? d.labels[0] : d;
           label.labelData = await withLimitedQuantityMark('CREATE-LABEL', label.labelData, labelFmt.format, order, box);
+          label.labelData = await withOrientationArrows('CREATE-LABEL', label.labelData, labelFmt.format, order, box);
 
           const trk = isInternational
             ? (label.packageId || label.dhlPackageId || packageId)
