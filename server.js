@@ -418,9 +418,15 @@ async function lqMarkPdf(pdfBase64, caption) {
   page.drawSvgPath(P([[g.cx, g.cy - g.r], [g.cx + g.r, g.cy], [g.cx, g.cy + g.r], [g.cx - g.r, g.cy]]), { ...at, color: rgb(0, 0, 0) });
   const w = g.ri - g.a;                    // half-width of the white band at its top and bottom
   page.drawSvgPath(P([[g.cx - w, g.cy - g.a], [g.cx + w, g.cy - g.a], [g.cx + g.ri, g.cy], [g.cx + w, g.cy + g.a], [g.cx - w, g.cy + g.a], [g.cx - g.ri, g.cy]]), { ...at, color: rgb(1, 1, 1) });
+  // One caption line per entry, centred; the size drops until the widest fits.
   const font = await doc.embedFont(StandardFonts.HelveticaBold);
-  const size = 14;
-  page.drawText(caption, { x: (W - font.widthOfTextAtSize(caption, size)) / 2, y: 7 * mm, size, font, color: rgb(0, 0, 0) });
+  const room = W - 2 * 4 * mm;
+  let size = 14;
+  while (size > 6 && Math.max(...caption.map(l => font.widthOfTextAtSize(l, size))) > room) size -= 0.5;
+  caption.forEach((line, i) => {
+    const y = 7 * mm + (caption.length - 1 - i) * size * 1.25;
+    page.drawText(line, { x: (W - font.widthOfTextAtSize(line, size)) / 2, y, size, font, color: rgb(0, 0, 0) });
+  });
   return Buffer.from(await doc.save()).toString('base64');
 }
 
@@ -448,7 +454,10 @@ function lqMarkZpl(label, caption) {
       strip(g.cx + hw - bar, y, bar);
     }
   }
-  out.push('^FO0,' + Math.round(H - 14 * dpm) + '^A0N,' + Math.round(5 * dpm) + ',' + Math.round(5 * dpm) + '^FB' + W + ',1,0,C^FD' + caption.replace(/[\^~\\]/g, ' ') + '^FS', '^XZ');
+  // ^FB wraps inside the label width; \& starts each caption line on its own row.
+  const text = caption.map(l => l.replace(/[\^~\\]/g, ' ')).join('\\&');
+  const lines = caption.length + 1;        // room for one extra wrap of a long order code
+  out.push('^FO' + Math.round(4 * dpm) + ',' + Math.round(H - (6 + 6 * lines) * dpm) + '^A0N,' + Math.round(5 * dpm) + ',' + Math.round(5 * dpm) + '^FB' + Math.round(W - 8 * dpm) + ',' + lines + ',' + Math.round(dpm) + ',C^FD' + text + '^FS', '^XZ');
   const both = zpl.replace(/\s+$/, '') + '\n' + out.join('\n') + '\n';
   return plain ? both : Buffer.from(both).toString('base64');
 }
@@ -459,7 +468,8 @@ function lqMarkZpl(label, caption) {
 async function withLimitedQuantityMark(tag, label, format, order, box) {
   if (!label || !needsLimitedQuantityMark(order, box)) return label;
   const fmt = String(format || '').toLowerCase();
-  const caption = 'LIMITED QUANTITY - ' + (order.shipmentOrderCode || '');
+  // Two lines, so a long order code never runs off the edge of the label.
+  const caption = ['LIMITED QUANTITY', order.shipmentOrderCode || ''].filter(Boolean);
   try {
     let out;
     if (fmt.includes('zpl')) out = lqMarkZpl(label, caption);
