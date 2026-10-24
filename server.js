@@ -1132,10 +1132,10 @@ app.post('/create-label', async (req, res) => {
           label.labelData = await withLimitedQuantityMark('CREATE-LABEL', label.labelData, labelFmt.format, order, box);
           label.labelData = await withOrientationArrows('CREATE-LABEL', label.labelData, labelFmt.format, order, box);
 
-          // International labels come back with no trackingId; dhlPackageId (3387…) is the
-          // number DHL tracks. Our own packageId (SPY…) made Shopify guess "Asendia USA".
+          // International labels come back with no trackingId. Our own packageId (SPY…) tracks on
+          // DHL webtrack, and the trackingUrl below tells Shopify where to send the customer.
           const trk = isInternational
-            ? (label.dhlPackageId || label.packageId || packageId)
+            ? (label.packageId || label.dhlPackageId || packageId)
             : (stripUspsPrefix(label.trackingId) || label.dhlPackageId || packageId);
 
           if (label.labelData) {
