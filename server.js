@@ -1086,7 +1086,7 @@ app.post('/create-label', async (req, res) => {
           },
           consigneeAddress: {
             name:        toContact.name    || '',
-            companyName: toContact.company || '',
+            companyName: (toContact.company || '').slice(0, 30), // DHL rejects > 30 chars
             address1:    shipTo.address1   || '',
             address2:    shipTo.address2   || '',
             city:        shipTo.city       || '',
