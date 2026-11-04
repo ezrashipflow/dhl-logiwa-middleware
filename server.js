@@ -140,7 +140,6 @@ function mapServiceToDHL(s) {
   if (!s) return 'GND';
   const u = s.toUpperCase();
   if (u === 'PLT-DDP') return 'PLT';
-  if (u === FAR_ZONE_OPTION) return 'EXP';
   const map = {
     'GND':'GND','GROUND':'GND','EXP':'EXP','EXPEDITED':'EXP',
     'MAX':'MAX','BGN':'BGN','BEX':'BEX','PLT':'PLT','PLY':'PLY',
@@ -309,13 +308,14 @@ const DG_INTL_COUNTRIES = ['CA', 'MX'];
 // The DHL product offered to Logiwa only when the order holds hazmat.
 const HAZMAT_ONLY_SERVICE = 'GND';
 
-// Zone-limited Expedited. Alongside the normal EXP rate we also return
-// FAR_ZONE_OPTION, but only when DHL prices every box in one of
-// FAR_ZONE_ZONES (from rate.priceZone, e.g. "USPS07"). Only the presets that
-// list this code (MJNY) can pick it; everyone else keeps plain EXP. The label
-// is booked as ordinary EXP.
-const FAR_ZONE_OPTION = 'EXP-FARZONE';
-const FAR_ZONE_ZONES  = (process.env.DHL_FAR_ZONE_ZONES || '6,7,8')
+// Zone-limited clients (MJNY). On their domestic orders we return DHL
+// Expedited only, and only when DHL prices every box in one of
+// FAR_ZONE_ZONES (from rate.priceZone, e.g. "USPS07"). Nearer zones get no
+// DHL rate at all, so Logiwa ships them with the other carriers. Every other
+// client is unchanged.
+const FAR_ZONE_CLIENTS = (process.env.DHL_FAR_ZONE_CLIENTS || '1e54da18-d53e-45f6-ae9a-1f24416f035e') // MJNY
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+const FAR_ZONE_ZONES   = (process.env.DHL_FAR_ZONE_ZONES || '6,7,8')
   .split(',').map(z => parseInt(z, 10)).filter(Boolean);
 function priceZoneNum(p) {
   const m = String(p?.rate?.priceZone || '').match(/(\d+)$/);
@@ -989,22 +989,16 @@ app.post('/get-rate', async (req, res) => {
               estimatedDays:  v.estDays,
             }));
 
-          // Zone-limited copy of EXP (see FAR_ZONE_OPTION). Domestic only.
-          const exp = svc['EXP'];
-          if (!isIntl && exp && exp.count === nBoxes) {
-            if (exp.zones.every(z => FAR_ZONE_ZONES.includes(z))) {
-              rateList.push({
-                carrier:        order.carrier || 'DHLEC',
-                shippingOption: FAR_ZONE_OPTION,
-                totalCost:      round2(exp.cost),
-                shippingCost:   round2(exp.cost),
-                otherCost:      0,
-                currency:       exp.currency,
-                estimatedDays:  exp.estDays,
-              });
-              console.log('[GET-RATE] zone ' + exp.zones.join('/') + ' → ' + FAR_ZONE_OPTION + ' $' + round2(exp.cost));
-            } else {
-              console.log('[GET-RATE] zone ' + exp.zones.join('/') + ' — ' + FAR_ZONE_OPTION + ' not offered (zones ' + FAR_ZONE_ZONES.join(',') + ' only)');
+          // Zone-limited clients (see FAR_ZONE_CLIENTS): EXP only, far zones only.
+          if (!isIntl && FAR_ZONE_CLIENTS.includes(String(order.clientIdentifier || '').toLowerCase())) {
+            const exp = svc['EXP'];
+            const far = exp && exp.count === nBoxes && exp.zones.every(z => FAR_ZONE_ZONES.includes(z));
+            const zones = exp ? exp.zones.join('/') : '?';
+            rateList = far ? rateList.filter(r => r.shippingOption === 'EXP') : [];
+            if (far) console.log('[GET-RATE] ' + (order.clientDisplayName || 'zone-limited client') + ' zone ' + zones + ' → EXP $' + round2(exp.cost) + ' only');
+            else {
+              msg = 'DHL is offered to ' + (order.clientDisplayName || 'this client') + ' only for zones ' + FAR_ZONE_ZONES.join(',') + ' (this order: zone ' + zones + ')';
+              console.log('[GET-RATE] ' + msg);
             }
           }
         }
