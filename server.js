@@ -140,6 +140,7 @@ function mapServiceToDHL(s) {
   if (!s) return 'GND';
   const u = s.toUpperCase();
   if (u === 'PLT-DDP') return 'PLT';
+  if (u === FAR_ZONE_OPTION) return 'EXP';
   const map = {
     'GND':'GND','GROUND':'GND','EXP':'EXP','EXPEDITED':'EXP',
     'MAX':'MAX','BGN':'BGN','BEX':'BEX','PLT':'PLT','PLY':'PLY',
@@ -307,6 +308,19 @@ const DG_ALL_SERVICES  = ['GND', 'EXP', 'MAX'];
 const DG_INTL_COUNTRIES = ['CA', 'MX'];
 // The DHL product offered to Logiwa only when the order holds hazmat.
 const HAZMAT_ONLY_SERVICE = 'GND';
+
+// Zone-limited Expedited. Alongside the normal EXP rate we also return
+// FAR_ZONE_OPTION, but only when DHL prices every box in one of
+// FAR_ZONE_ZONES (from rate.priceZone, e.g. "USPS07"). Only the presets that
+// list this code (MJNY) can pick it; everyone else keeps plain EXP. The label
+// is booked as ordinary EXP.
+const FAR_ZONE_OPTION = 'EXP-FARZONE';
+const FAR_ZONE_ZONES  = (process.env.DHL_FAR_ZONE_ZONES || '6,7,8')
+  .split(',').map(z => parseInt(z, 10)).filter(Boolean);
+function priceZoneNum(p) {
+  const m = String(p?.rate?.priceZone || '').match(/(\d+)$/);
+  return m ? parseInt(m[1], 10) : null;
+}
 
 function isHazmatLine(p) {
   return !!p && (p.isHazardous === true || String(p.isHazardous).toLowerCase() === 'true'
@@ -903,16 +917,17 @@ app.post('/get-rate', async (req, res) => {
         // Combine boxes into order-level options. A service is only offered if
         // it priced for EVERY box; the order cost is the sum across boxes.
         const nBoxes = perBoxProducts.length;
-        const svc = {}; // serviceId -> { cost, currency, estDays, count }
+        const svc = {}; // serviceId -> { cost, currency, estDays, count, zones }
         perBoxProducts.forEach((prods) => {
           prods.forEach((p) => {
             const id   = p.orderedProductId || p.productId || p.productName || 'GND';
             const amt  = parseFloat(p.rate?.amount || 0);
             const cur  = p.rate?.currency || currency;
             const days = parseInt(p.estimatedDeliveryDate?.deliveryDaysMin, 10);
-            if (!svc[id]) svc[id] = { cost: 0, currency: cur, estDays: null, count: 0 };
+            if (!svc[id]) svc[id] = { cost: 0, currency: cur, estDays: null, count: 0, zones: [] };
             svc[id].cost  += amt;
             svc[id].count += 1;
+            svc[id].zones.push(priceZoneNum(p));
             if (days) svc[id].estDays = Math.max(svc[id].estDays || 0, days);
           });
         });
@@ -973,6 +988,25 @@ app.post('/get-rate', async (req, res) => {
               currency:       v.currency,
               estimatedDays:  v.estDays,
             }));
+
+          // Zone-limited copy of EXP (see FAR_ZONE_OPTION). Domestic only.
+          const exp = svc['EXP'];
+          if (!isIntl && exp && exp.count === nBoxes) {
+            if (exp.zones.every(z => FAR_ZONE_ZONES.includes(z))) {
+              rateList.push({
+                carrier:        order.carrier || 'DHLEC',
+                shippingOption: FAR_ZONE_OPTION,
+                totalCost:      round2(exp.cost),
+                shippingCost:   round2(exp.cost),
+                otherCost:      0,
+                currency:       exp.currency,
+                estimatedDays:  exp.estDays,
+              });
+              console.log('[GET-RATE] zone ' + exp.zones.join('/') + ' → ' + FAR_ZONE_OPTION + ' $' + round2(exp.cost));
+            } else {
+              console.log('[GET-RATE] zone ' + exp.zones.join('/') + ' — ' + FAR_ZONE_OPTION + ' not offered (zones ' + FAR_ZONE_ZONES.join(',') + ' only)');
+            }
+          }
         }
 
         console.log('[GET-RATE] OK ' + order.shipmentOrderCode + ' — ' + rateList.length + ' rates (' + nBoxes + ' boxes)');
