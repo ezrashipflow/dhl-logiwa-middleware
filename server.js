@@ -308,6 +308,20 @@ const DG_INTL_COUNTRIES = ['CA', 'MX'];
 // The DHL product offered to Logiwa only when the order holds hazmat.
 const HAZMAT_ONLY_SERVICE = 'GND';
 
+// Zone-limited clients (MJNY). On their domestic orders we return DHL
+// Expedited only, and only when DHL prices every box in one of
+// FAR_ZONE_ZONES (from rate.priceZone, e.g. "USPS07"). Nearer zones get no
+// DHL rate at all, so Logiwa ships them with the other carriers. Every other
+// client is unchanged.
+const FAR_ZONE_CLIENTS = (process.env.DHL_FAR_ZONE_CLIENTS || '1e54da18-d53e-45f6-ae9a-1f24416f035e') // MJNY
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+const FAR_ZONE_ZONES   = (process.env.DHL_FAR_ZONE_ZONES || '6,7,8')
+  .split(',').map(z => parseInt(z, 10)).filter(Boolean);
+function priceZoneNum(p) {
+  const m = String(p?.rate?.priceZone || '').match(/(\d+)$/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
 function isHazmatLine(p) {
   return !!p && (p.isHazardous === true || String(p.isHazardous).toLowerCase() === 'true'
     || !!p.hazmatIdentificationNumber || !!p.hazmatClassDivisionNumber);
@@ -903,16 +917,17 @@ app.post('/get-rate', async (req, res) => {
         // Combine boxes into order-level options. A service is only offered if
         // it priced for EVERY box; the order cost is the sum across boxes.
         const nBoxes = perBoxProducts.length;
-        const svc = {}; // serviceId -> { cost, currency, estDays, count }
+        const svc = {}; // serviceId -> { cost, currency, estDays, count, zones }
         perBoxProducts.forEach((prods) => {
           prods.forEach((p) => {
             const id   = p.orderedProductId || p.productId || p.productName || 'GND';
             const amt  = parseFloat(p.rate?.amount || 0);
             const cur  = p.rate?.currency || currency;
             const days = parseInt(p.estimatedDeliveryDate?.deliveryDaysMin, 10);
-            if (!svc[id]) svc[id] = { cost: 0, currency: cur, estDays: null, count: 0 };
+            if (!svc[id]) svc[id] = { cost: 0, currency: cur, estDays: null, count: 0, zones: [] };
             svc[id].cost  += amt;
             svc[id].count += 1;
+            svc[id].zones.push(priceZoneNum(p));
             if (days) svc[id].estDays = Math.max(svc[id].estDays || 0, days);
           });
         });
@@ -973,6 +988,19 @@ app.post('/get-rate', async (req, res) => {
               currency:       v.currency,
               estimatedDays:  v.estDays,
             }));
+
+          // Zone-limited clients (see FAR_ZONE_CLIENTS): EXP only, far zones only.
+          if (!isIntl && FAR_ZONE_CLIENTS.includes(String(order.clientIdentifier || '').toLowerCase())) {
+            const exp = svc['EXP'];
+            const far = exp && exp.count === nBoxes && exp.zones.every(z => FAR_ZONE_ZONES.includes(z));
+            const zones = exp ? exp.zones.join('/') : '?';
+            rateList = far ? rateList.filter(r => r.shippingOption === 'EXP') : [];
+            if (far) console.log('[GET-RATE] ' + (order.clientDisplayName || 'zone-limited client') + ' zone ' + zones + ' → EXP $' + round2(exp.cost) + ' only');
+            else {
+              msg = 'DHL is offered to ' + (order.clientDisplayName || 'this client') + ' only for zones ' + FAR_ZONE_ZONES.join(',') + ' (this order: zone ' + zones + ')';
+              console.log('[GET-RATE] ' + msg);
+            }
+          }
         }
 
         console.log('[GET-RATE] OK ' + order.shipmentOrderCode + ' — ' + rateList.length + ' rates (' + nBoxes + ' boxes)');
