@@ -884,7 +884,9 @@ app.post('/get-rate', async (req, res) => {
             rate:               { calculate: true, currency },
             estimatedDeliveryDate: { calculate: true },
             packageDetail: {
-              packageId:          ('RATE-' + (order.shipmentOrderCode||'').replace(/[^A-Za-z0-9]/g,'') + '-' + (box.packageSequenceNumber ?? 0) + '-' + Date.now()).slice(0,30),
+              // DHL: max 30 chars, must start AND end alphanumeric. Long order codes (e.g. Mercatalyst's
+              // "curved-agreeable-apricot") used to cut the id right after a '-' → 400 → no DHL rate.
+              packageId:          ('R' + (order.shipmentOrderCode||'').replace(/[^A-Za-z0-9]/g,'').slice(0,14) + '-' + (box.packageSequenceNumber ?? 0) + '-' + Date.now()).slice(0,30),
               packageDescription: order.shipmentOrderCode || 'Shipment',
               weight: { unitOfMeasure: 'LB', value: weightLB },
               ...(dg.perBox[b].category && { contentCategory: dg.perBox[b].category }),
