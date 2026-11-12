@@ -835,6 +835,21 @@ app.post('/get-rate', async (req, res) => {
   const orders = parseLogiwaBody(req.body);
   console.log('\n[GET-RATE] ══ Incoming Logiwa request ══ orders=' + orders.length + ' first=' + orders[0]?.shipmentOrderCode + ' service=' + orders[0]?.shippingOption + ' to=' + (orders[0]?.shipTo?.address?.PostalCode || orders[0]?.shipTo?.address?.postalCode || '?'));
 
+  // Pause switch: DHL_RATES_PAUSED=1 (Railway variable) returns no DHL rates, so Logiwa's rate shop
+  // skips DHL and picks the next cheapest carrier. Used during DHL label outages (e.g. 2026-11-12 503s).
+  if (process.env.DHL_RATES_PAUSED === '1') {
+    console.log('[GET-RATE] PAUSED (DHL_RATES_PAUSED=1) — no DHL rates for ' + orders[0]?.shipmentOrderCode);
+    return res.json({
+      data: orders.map((o) => ({
+        shipmentOrderCode:       o.shipmentOrderCode,
+        shipmentOrderIdentifier: o.shipmentOrderIdentifier,
+        rateList:     [],
+        isSuccessful: false,
+        message:      ['DHL temporarily paused by ShipFlow'],
+      })),
+    });
+  }
+
   try {
     const token  = await getDHLToken();
     const out    = [];
