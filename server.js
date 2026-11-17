@@ -101,12 +101,32 @@ async function getDHLToken() {
 
 function parseLogiwaBody(body) { return Array.isArray(body) ? body : [body]; }
 
+// DHL refuses an address line over 50 characters ("address1 must be at most 50 characters long"), which
+// failed both the rate and the label. A long line 1 is split at a space; the rest goes in front of line 2.
+const DHL_LINE_MAX = 50;
+function fitAddressLines(l1, l2) {
+  l1 = String(l1 || '').replace(/\s+/g, ' ').trim();
+  l2 = String(l2 || '').replace(/\s+/g, ' ').trim();
+  if (l1.length > DHL_LINE_MAX) {
+    let cut = l1.lastIndexOf(' ', DHL_LINE_MAX);
+    if (cut < 20) cut = DHL_LINE_MAX;
+    l2 = (l1.slice(cut).trim() + (l2 ? ' ' + l2 : '')).trim();
+    l1 = l1.slice(0, cut).trim();
+  }
+  if (l2.length > DHL_LINE_MAX) {
+    const cut = l2.lastIndexOf(' ', DHL_LINE_MAX);
+    l2 = l2.slice(0, cut >= 20 ? cut : DHL_LINE_MAX).trim();
+  }
+  return [l1, l2];
+}
+
 function getAddr(obj) {
   if (!obj) return {};
   const a = obj.address || obj;
+  const [address1, address2] = fitAddressLines(a.AddressLine1 || a.addressLine1 || a.adressLine1 || '', a.AddressLine2 || a.addressLine2 || '');
   return {
-    address1:   a.AddressLine1 || a.addressLine1 || a.adressLine1 || '',
-    address2:   a.AddressLine2 || a.addressLine2 || '',
+    address1,
+    address2,
     city:       a.City         || a.city         || '',
     state:      a.StateOrProvinceCode || a.stateOrProvinceCode || '',
     postalCode: a.PostalCode   || a.postalCode   || '',
