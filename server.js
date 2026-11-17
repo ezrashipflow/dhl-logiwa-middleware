@@ -1062,9 +1062,71 @@ app.post('/get-rate', async (req, res) => {
 
 // ─── CREATE LABEL ─────────────────────────────────────────────────────────────
 
+// ─── REPEAT / DOUBLE-CLICK LABEL GUARD ────────────────────────────────────────
+// Same guard as the ShipStation middleware (its PR #3, 2026-11-10). A packer pressing
+// Complete & Print twice sends the same create-label twice; this middleware used to buy
+// a label for each. Seen 2026-11-09/10 on 6744211224_1-A and 113-5706926-4449840: two
+// DHL labels each, and the customer's channel got whichever one Logiwa kept.
+//
+// - Double click: a second create for the same order while the first is still running,
+//   or within DOUBLE_CLICK_MS of it, is REFUSED with no label at all, so Logiwa has
+//   nothing to void and the printed label stays live.
+// - Later repeats (up to REPEAT_WINDOW_MS, e.g. a retry after a timeout) get the first
+//   answer back instead of a new label. Each handout is counted, and a void only voids
+//   at DHL once no other handout is left (the copy on the box must not be cancelled).
+// In-memory only: a restart forgets recent orders.
+const REPEAT_WINDOW_MS = 10 * 60 * 1000;
+const DOUBLE_CLICK_MS = 60 * 1000;
+const recentLabels = {};    // repeatKey -> { at, body, master, handedOut }
+const labelsInFlight = {};  // order code -> start time
+
+function repeatKey(order) {
+  const boxes = getBoxes(order).map((b) => [b.weight?.Value ?? b.weight?.value, b.dimensions?.Length ?? b.dimensions?.length,
+    b.dimensions?.Width ?? b.dimensions?.width, b.dimensions?.Height ?? b.dimensions?.height].join('x'));
+  return [order.shipmentOrderCode, order.shippingOption, getAddr(order.shipTo).postalCode, boxes.join('|')].join('~');
+}
+
+function refuseCreate(order, text) {
+  return { data: [{
+    shipmentOrderIdentifier: order.shipmentOrderIdentifier,
+    shipmentOrderCode:       order.shipmentOrderCode,
+    carrier:        order.carrier || 'DHLEC',
+    shippingOption: order.shippingOption,
+    packageResponse: [],
+    rateDetail: { totalCost: 0, shippingCost: 0, otherCost: 0, currency: order.currency || 'USD' },
+    masterTrackingNumber: '',
+    isSuccessful: false,
+    message: [text],
+  }] };
+}
+
 app.post('/create-label', async (req, res) => {
   const orders = parseLogiwaBody(req.body);
   console.log('\n[CREATE-LABEL] ══ Incoming Logiwa request ══ orders=' + orders.length + ' first=' + orders[0]?.shipmentOrderCode + ' carrier=' + orders[0]?.carrier + ' service=' + orders[0]?.shippingOption);
+
+  const first = orders[0] || {};
+  const orderKey = first.shipmentOrderCode || '';
+  const rKey = orderKey ? repeatKey(first) : '';
+  const recent = rKey ? recentLabels[rKey] : null;
+  if (orderKey && labelsInFlight[orderKey] && Date.now() - labelsInFlight[orderKey] < 2 * 60 * 1000) {
+    console.log('[CREATE-LABEL] DOUBLE-CLICK ' + orderKey + ' — a label for this order is still being bought; refused (no label sent, nothing for Logiwa to void)');
+    return res.json(refuseCreate(first, 'Duplicate request: a label for this order is already being created. Ignore this message; the first label is the good one.'));
+  }
+  if (recent && Date.now() - recent.at < DOUBLE_CLICK_MS) {
+    const ago = Math.round((Date.now() - recent.at) / 1000);
+    console.log('[CREATE-LABEL] DOUBLE-CLICK ' + orderKey + ' — label ' + recent.master + ' made ' + ago + ' s ago; refused (no label sent, nothing for Logiwa to void)');
+    return res.json(refuseCreate(first, 'Duplicate request: label ' + recent.master + ' was created ' + ago + ' s ago for this order. Ignore this message; that label is the good one.'));
+  }
+  if (recent && Date.now() - recent.at < REPEAT_WINDOW_MS) {
+    recent.handedOut = (recent.handedOut || 1) + 1;
+    console.log('[CREATE-LABEL] REPEAT ' + orderKey + ' — same order/service/boxes ' + Math.round((Date.now() - recent.at) / 1000) + ' s ago; sending back master=' + recent.master + ' instead of buying another label');
+    return res.json(recent.body);
+  }
+  if (orderKey) {
+    labelsInFlight[orderKey] = Date.now();
+    res.on('finish', () => { delete labelsInFlight[orderKey]; });
+    res.on('close', () => { delete labelsInFlight[orderKey]; });
+  }
 
   try {
     const token  = await getDHLToken();
@@ -1251,6 +1313,11 @@ app.post('/create-label', async (req, res) => {
     const logiwaResponse = { data: [out[0]] };
     const allTrk = (out[0]?.packageResponse || []).map(p => p.trackingNumber).join(', ');
     console.log('[CREATE-LABEL] → Response to Logiwa: ' + (out[0]?.packageResponse?.length || 0) + ' label(s) [' + allTrk + '] master=' + out[0]?.masterTrackingNumber + ' success=' + out[0]?.isSuccessful);
+    if (rKey && out[0]?.isSuccessful && out[0]?.masterTrackingNumber) {
+      // Forget entries older than a day so the map can't grow without end.
+      for (const [k, v] of Object.entries(recentLabels)) if (Date.now() - v.at > 24 * 3600 * 1000) delete recentLabels[k];
+      recentLabels[rKey] = { at: Date.now(), body: logiwaResponse, master: out[0].masterTrackingNumber, handedOut: 1 };
+    }
     return res.json(logiwaResponse);
 
   } catch (err) {
@@ -1277,6 +1344,16 @@ app.post('/create-label', async (req, res) => {
 app.post('/void-label', async (req, res) => {
   const orders = parseLogiwaBody(req.body);
   console.log('\n[VOID-LABEL] ══ Incoming Logiwa request ══ trk=' + orders[0]?.masterTrackingNumber);
+
+  // A label handed out more than once (repeat guard): this void only gives back one
+  // handout. The other copy is still live and may already be on a box.
+  const vMaster = orders[0]?.masterTrackingNumber || '';
+  const shared = Object.values(recentLabels).find((v) => vMaster && v.master === vMaster && v.handedOut > 1);
+  if (shared) {
+    shared.handedOut -= 1;
+    console.log('[VOID-LABEL] VOID SKIPPED ' + vMaster + ' — this label was sent to Logiwa more than once; voiding it would cancel the copy already printed. Still live at DHL; ' + shared.handedOut + ' handout(s) left.');
+    return res.json({ data: [{ shipmentOrderIdentifier: orders[0].shipmentOrderIdentifier, masterTrackingNumber: vMaster, externalReference: orders[0].externalReference || '', isSuccessful: true, message: [] }] });
+  }
   try {
     const token  = await getDHLToken();
     const out    = [];
@@ -1293,6 +1370,7 @@ app.post('/void-label', async (req, res) => {
         const dhlRes = await axios.delete(voidUrl, { headers: { Authorization: 'Bearer ' + token } });
         logResponse('VOID-LABEL', dhlRes.status, dhlRes.data);
         delete labelCache[trk];
+        for (const [k, v] of Object.entries(recentLabels)) if (v.master === trk) delete recentLabels[k];
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
           masterTrackingNumber:    order.masterTrackingNumber,
