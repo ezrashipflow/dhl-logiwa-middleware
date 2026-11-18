@@ -195,6 +195,8 @@ function buildCustomsDetails(customsItems, currency) {
       currency:         currency || 'USD',
       countryOfOrigin:  item.originCountryCode || 'US',
       ...(item.hsTariffCode && { hsCode: item.hsTariffCode }),
+      // Some destinations (e.g. Japan) refuse a customs line without a SKU.
+      ...(item.sku && { skuNumber: String(item.sku).slice(0, 20) }),
     };
   });
 }
@@ -258,6 +260,8 @@ function buildCustomsFromProducts(products, currency, unitValues) {
       currency:         currency || 'USD',
       countryOfOrigin:  item.originCountryCode || 'US',
       ...(item.hsTariffCode && { hsCode: item.hsTariffCode }),
+      // Some destinations (e.g. Japan) refuse a customs line without a SKU.
+      ...(item.sku && { skuNumber: String(item.sku).slice(0, 20) }),
     };
   });
 }
