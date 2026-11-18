@@ -22,6 +22,7 @@
 const express = require('express');
 const axios = require('axios');
 require('dotenv').config();
+const { fillZeroCustomsValues, zeroValueRefusal } = require('./zero-value');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -281,9 +282,13 @@ function boxCustomsAndValue(order, box) {
     ) / 100;
     return { customs, declaredValue };
   }
+  const customs = buildCustomsDetails(order.internationalOptions?.customsItems, order.currency);
+  const fromItems = (customs || []).reduce((s, c) => s + c.itemValue * c.packagedQuantity, 0);
   return {
-    customs:       buildCustomsDetails(order.internationalOptions?.customsItems, order.currency),
-    declaredValue: parseFloat(order.shipmentOrderTotalPrice || 0),
+    customs,
+    // A $0 order whose lines were filled from Sales Price (zero-value.js) must
+    // not declare the $0 order total.
+    declaredValue: parseFloat(order.shipmentOrderTotalPrice || 0) || Math.round(fromItems * 100) / 100,
   };
 }
 
@@ -878,6 +883,7 @@ app.post('/get-rate', async (req, res) => {
       const shipTo    = getAddr(order.shipTo);
       const toContact = getContact(order.shipTo);
       const isIntl   = (shipTo.country || 'US').toUpperCase() !== 'US';
+      if (isIntl) await fillZeroCustomsValues(order, 'GET-RATE');
       const isDDP    = (order.shippingOption || '').toUpperCase() === 'PLT-DDP';
       const currency = order.currency || 'USD';
       const boxes    = getBoxes(order);
@@ -1169,6 +1175,13 @@ app.post('/create-label', async (req, res) => {
       const errors = [];
       let orderCost = 0;
       let masterTrk = '';
+
+      // $0 customs lines -> product Sales Price (zero-value.js). A line that
+      // stays at $0 refuses the label rather than declaring $0 to customs.
+      if (isInternational) {
+        const zeroWhy = zeroValueRefusal(await fillZeroCustomsValues(order, 'CREATE-LABEL'));
+        if (zeroWhy) errors.push(zeroWhy);
+      }
 
       // Hazmat: refuse the whole order before buying any label if DHL cannot
       // carry it, or if the chosen service is not one allowed to carry it.
